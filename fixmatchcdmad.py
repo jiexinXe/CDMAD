@@ -8,6 +8,10 @@ import time
 import random
 import math
 import numpy as np
+
+# 恢复 np.int 为内置 int
+setattr(np, 'int', int)
+
 import wrn as models
 import torch
 import torch.nn as nn
@@ -181,6 +185,7 @@ def main():
                 GM2 *= (testclassacc2[i]) ** (1 / num_class)
 
         print( "without test debias bACC:",testclassacc1.mean(),"GM:",GM,"with test debias bACC:",testclassacc2.mean(),"GM",GM2)
+        logger.append([testclassacc1.mean(), GM, testclassacc2.mean(), GM2, testclassacc1.mean()])
 
         save_checkpoint({
                 'epoch': epoch + 1,
@@ -209,16 +214,16 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
     for batch_idx in range(args.val_iteration):
 
         try:
-            inputs_x, targets_x, _ = labeled_train_iter.next()
+            inputs_x, targets_x, _ = next(labeled_train_iter)
         except:
             labeled_train_iter = iter(labeled_trainloader)
-            inputs_x,  targets_x, _ = labeled_train_iter.next()
+            inputs_x,  targets_x, _ = next(labeled_train_iter)
 
         try:
-            (inputs_u, inputs_u2, inputs_u3), _, idx_u = unlabeled_train_iter.next()
+            (inputs_u, inputs_u2, inputs_u3), _, idx_u = next(unlabeled_train_iter)
         except:
             unlabeled_train_iter = iter(unlabeled_trainloader)
-            (inputs_u, inputs_u2, inputs_u3), _, idx_u = unlabeled_train_iter.next()
+            (inputs_u, inputs_u2, inputs_u3), _, idx_u = next(unlabeled_train_iter)
 
         data_time.update(time.time() - end)
         batch_size = inputs_x.size(0)
