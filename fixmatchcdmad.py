@@ -8,6 +8,10 @@ import time
 import random
 import math
 import numpy as np
+
+# 恢复 np.int 为内置 int
+setattr(np, 'int', int)
+
 import wrn as models
 import torch
 import torch.nn as nn
@@ -61,6 +65,9 @@ parser.add_argument('--dataset', type=str, default='cifar10', help='Dataset')
 parser.add_argument('--imbalancetype', type=str, default='long', help='Long tailed or step imbalanced')
 parser.add_argument('--unlabeledratio', type=float, default=2, help='Long tailed or step imbalanced')
 parser.add_argument('--debiasstart', type=int, default=100, help='Long tailed or step imbalanced')
+
+parser.add_argument('--lambda_perp', type=float, default=0.1,
+                        help='weight for bias‐vector orthogonalization loss')
 
 
 args = parser.parse_args()
@@ -181,7 +188,7 @@ def main():
                 GM2 *= (testclassacc2[i]) ** (1 / num_class)
 
         print( "without test debias bACC:",testclassacc1.mean(),"GM:",GM,"with test debias bACC:",testclassacc2.mean(),"GM",GM2)
-
+        logger.append([testclassacc1.mean(), GM, testclassacc2.mean(), GM2, testclassacc1.mean()])
         save_checkpoint({
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
@@ -209,16 +216,16 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
     for batch_idx in range(args.val_iteration):
 
         try:
-            inputs_x, targets_x, _ = labeled_train_iter.next()
+            inputs_x, targets_x, _ = next(labeled_train_iter)
         except:
             labeled_train_iter = iter(labeled_trainloader)
-            inputs_x,  targets_x, _ = labeled_train_iter.next()
+            inputs_x,  targets_x, _ = next(labeled_train_iter)
 
         try:
-            (inputs_u, inputs_u2, inputs_u3), _, idx_u = unlabeled_train_iter.next()
+            (inputs_u, inputs_u2, inputs_u3), _, idx_u = next(unlabeled_train_iter)
         except:
             unlabeled_train_iter = iter(unlabeled_trainloader)
-            (inputs_u, inputs_u2, inputs_u3), _, idx_u = unlabeled_train_iter.next()
+            (inputs_u, inputs_u2, inputs_u3), _, idx_u = next(unlabeled_train_iter)
 
         data_time.update(time.time() - end)
         batch_size = inputs_x.size(0)
@@ -232,8 +239,8 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
             white = torch.ones((1, 3, 32, 32)).cuda()
             biaseddegree, _ = model(white)
             outputs_u, _ = model(inputs_u)
-            if epoch>args.debiasstart:
-                outputs_u = outputs_u - biaseddegree.detach()
+            # if epoch>args.debiasstart:
+            #     outputs_u = outputs_u - biaseddegree.detach()
             targets_u2 = F.softmax(outputs_u).detach()
 
 
@@ -256,7 +263,59 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
 
         Lx, Lu = criterion(logits_x,all_targets[:batch_size], logits_u, all_targets[batch_size:], select_mask)
 
-        loss=Lx+Lu
+        # loss=Lx+Lu
+
+        # —— 方法二：偏置向量正交化 loss —— #
+        # 1) 计算一次 bias vector b（与 CDMAD 保持同步）
+        # 这里只用白色图像，下面使用多种颜色
+        # white = torch.ones((1, 3, 32, 32)).cuda()
+        # b, _   = model(white)                    # b: [1×C] logits
+        # b_norm = b.detach() / (b.detach().norm() + 1e-8)  # 单位化
+
+        # —— 方法二多基线偏置向量正交化 —— #
+        # 1) 在 GPU 上一次性构造多张基线：白 / 黑 / 灰 / 随机噪声
+        device = logits_x.device
+        baselines = torch.stack([
+            torch.ones((3, 32, 32), device=device),  # 白图
+            torch.zeros((3, 32, 32), device=device),  # 黑图
+            torch.full((3, 32, 32), 0.5, device=device),  # 中灰
+            torch.randn((3, 32, 32), device=device) * 0.1 + 0.5  # 随机噪声
+        ], dim=0)  # shape [4,3,32,32]
+
+        # —— 方法二：红/绿/蓝三基线偏置向量正交化 —— #
+        # device = logits_x.device
+        # 构造纯红、纯绿、纯蓝三张基线图
+        # red = torch.tensor([1.0, 0.0, 0.0], device=device).view(3, 1, 1).expand(3, 32, 32)
+        # green = torch.tensor([0.0, 1.0, 0.0], device=device).view(3, 1, 1).expand(3, 32, 32)
+        # blue = torch.tensor([0.0, 0.0, 1.0], device=device).view(3, 1, 1).expand(3, 32, 32)
+        # baselines = torch.stack([red, green, blue], dim=0)  # shape [3,3,32,32]
+
+        # 2) 模型前向，得到四条偏置 logits
+        b_all, _ = model(baselines)  # [4, C]
+        # 3) 单位化每条偏置向量
+        eps = 1e-8
+        norms = b_all.norm(dim=1, keepdim=True) + eps
+        b_norms = b_all.detach() / norms  # [4, C]
+
+        # 4) 合并成一个“平均偏置方向”（也可改成最大范数方向或其他聚合）
+        b_norm = b_norms.mean(dim=0)  # [C]
+
+        # 2) 计算各样本在 bias 方向上的投影
+        proj_x  = torch.matmul(logits_x,  b_norm.view(-1))      # [B]
+        proj_u2 = torch.matmul(logits_u2, b_norm.view(-1))      # [Bu]
+        proj_u3 = torch.matmul(logits_u3, b_norm.view(-1))      # [Bu]
+
+        # 3) 均方惩罚
+        L_perp_x = torch.mean(proj_x**2)
+        L_perp_u = torch.mean((proj_u2**2 + proj_u3**2) * 0.5)
+        L_perp   = L_perp_x + L_perp_u
+
+        # 4) 将正交化 loss 加到总 loss 里
+        if epoch >= args.debiasstart:
+            loss = Lx + Lu + args.lambda_perp * L_perp
+        else:
+            loss = Lx + Lu
+
         losses.update(loss.item(), inputs_x.size(0))
         losses_x.update(Lx.item(), inputs_x.size(0))
         losses_u.update(Lu.item(), inputs_x.size(0))
@@ -318,7 +377,9 @@ def validate(valloader,model,criterion,mode):
             # compute output
             targetsonehot = torch.zeros(inputs.size()[0], num_class).scatter_(1, targets.cpu().view(-1, 1).long(), 1)
             outputs,_=model(inputs)
-            outputs2=outputs-biaseddegree
+            # outputs2=outputs-biaseddegree
+            outputs2=outputs
+
 
             score = F.softmax(outputs)
             score2 = F.softmax(outputs2)
