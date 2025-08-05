@@ -239,8 +239,6 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
             white = torch.ones((1, 3, 32, 32)).cuda()
             biaseddegree, _ = model(white)
             outputs_u, _ = model(inputs_u)
-            # if epoch>args.debiasstart:
-            #     outputs_u = outputs_u - biaseddegree.detach()
             targets_u2 = F.softmax(outputs_u).detach()
 
 
@@ -263,34 +261,18 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
 
         Lx, Lu = criterion(logits_x,all_targets[:batch_size], logits_u, all_targets[batch_size:], select_mask)
 
-        # loss=Lx+Lu
-
         # —— 方法二：偏置向量正交化 loss —— #
-        # 1) 计算一次 bias vector b（与 CDMAD 保持同步）
-        # 这里只用白色图像，下面使用多种颜色
-        # white = torch.ones((1, 3, 32, 32)).cuda()
-        # b, _   = model(white)                    # b: [1×C] logits
-        # b_norm = b.detach() / (b.detach().norm() + 1e-8)  # 单位化
-
-        # —— 方法二多基线偏置向量正交化 —— #
         # 1) 在 GPU 上一次性构造多张基线：白 / 黑 / 灰 / 随机噪声
         device = logits_x.device
-        baselines = torch.stack([
-            torch.ones((3, 32, 32), device=device),  # 白图
-            torch.zeros((3, 32, 32), device=device),  # 黑图
-            torch.full((3, 32, 32), 0.5, device=device),  # 中灰
-            torch.randn((3, 32, 32), device=device) * 0.1 + 0.5  # 随机噪声
-        ], dim=0)  # shape [4,3,32,32]
 
         # —— 方法二：红/绿/蓝三基线偏置向量正交化 —— #
-        # device = logits_x.device
         # 构造纯红、纯绿、纯蓝三张基线图
-        # red = torch.tensor([1.0, 0.0, 0.0], device=device).view(3, 1, 1).expand(3, 32, 32)
-        # green = torch.tensor([0.0, 1.0, 0.0], device=device).view(3, 1, 1).expand(3, 32, 32)
-        # blue = torch.tensor([0.0, 0.0, 1.0], device=device).view(3, 1, 1).expand(3, 32, 32)
-        # baselines = torch.stack([red, green, blue], dim=0)  # shape [3,3,32,32]
+        red = torch.tensor([1.0, 0.0, 0.0], device=device).view(3, 1, 1).expand(3, 32, 32)
+        green = torch.tensor([0.0, 1.0, 0.0], device=device).view(3, 1, 1).expand(3, 32, 32)
+        blue = torch.tensor([0.0, 0.0, 1.0], device=device).view(3, 1, 1).expand(3, 32, 32)
+        baselines = torch.stack([red, green, blue], dim=0)  # shape [3,3,32,32]
 
-        # 2) 模型前向，得到四条偏置 logits
+        # 2) 模型前向，得到三条偏置 logits
         b_all, _ = model(baselines)  # [4, C]
         # 3) 单位化每条偏置向量
         eps = 1e-8
@@ -305,16 +287,21 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
         proj_u2 = torch.matmul(logits_u2, b_norm.view(-1))      # [Bu]
         proj_u3 = torch.matmul(logits_u3, b_norm.view(-1))      # [Bu]
 
-        # 3) 均方惩罚
-        L_perp_x = torch.mean(proj_x**2)
-        L_perp_u = torch.mean((proj_u2**2 + proj_u3**2) * 0.5)
-        L_perp   = L_perp_x + L_perp_u
+        # 2.3) 生成全局 debiased 版本
+        lu2_deb = logits_u2 - proj_u2.unsqueeze(1) * b_norm.unsqueeze(0)
+        lu3_deb = logits_u3 - proj_u3.unsqueeze(1) * b_norm.unsqueeze(0)
 
-        # 4) 将正交化 loss 加到总 loss 里
-        if epoch >= args.debiasstart:
-            loss = Lx + Lu + args.lambda_perp * L_perp
-        else:
-            loss = Lx + Lu
+        # —— 实现：3) 仅保留 mask 内的 debiased logits —— #
+        # select_mask 是 [Bu]，True 表示高置信伪标签
+        mask = select_mask[:logits_u2.size(0)]
+        # expand to [Bu, C]
+        mask_expand = mask.unsqueeze(1).float()
+        logits_u2_final = lu2_deb * mask_expand + logits_u2 * (1 - mask_expand)
+        logits_u3_final = lu3_deb * mask_expand + logits_u3 * (1 - mask_expand)
+
+        # 4) 用 debiased 的 unlabeled logits 计算 pseudo‐loss
+        logits_u = torch.cat([logits_u2_final, logits_u3_final], dim=0)
+        loss = Lx + Lu  # Lx 不变，Lu 已在 criterion 内基于 logits_u 计算
 
         losses.update(loss.item(), inputs_x.size(0))
         losses_x.update(Lx.item(), inputs_x.size(0))
@@ -360,6 +347,16 @@ def validate(valloader,model,criterion,mode):
     # switch to evaluate mode
     model.eval()
 
+    # 1) 预先计算一次 b_norm（同训练时用到的基线集合）
+    with torch.no_grad():
+        red = torch.tensor([1.0, 0.0, 0.0]).view(3, 1, 1).expand(3, 32, 32).cuda()
+        green = torch.tensor([0.0, 1.0, 0.0]).view(3, 1, 1).expand(3, 32, 32).cuda()
+        blue = torch.tensor([0.0, 0.0, 1.0]).view(3, 1, 1).expand(3, 32, 32).cuda()
+        baselines = torch.stack([red, green, blue], dim=0)  # shape [3,3,32,32]
+        b_all, _ = model(baselines)
+        b_norms = b_all / (b_all.norm(dim=1, keepdim=True) + 1e-8)
+        b_norm = b_norms.mean(dim=0)  # [C]
+
     accperclass = np.zeros((num_class))
     accperclass2 = np.zeros((num_class))
 
@@ -377,8 +374,11 @@ def validate(valloader,model,criterion,mode):
             # compute output
             targetsonehot = torch.zeros(inputs.size()[0], num_class).scatter_(1, targets.cpu().view(-1, 1).long(), 1)
             outputs,_=model(inputs)
-            # outputs2=outputs-biaseddegree
-            outputs2=outputs
+            # 4) 去偏前向——在 logits 空间正交化
+            # proj: [B] 每个样本在偏置方向上的分量
+            proj = torch.matmul(outputs, b_norm.view(-1))
+            # 从 outputs 中减去这个分量的投影
+            outputs2 = outputs - proj.unsqueeze(1) * b_norm.unsqueeze(0)
 
 
             score = F.softmax(outputs)
