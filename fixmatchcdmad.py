@@ -66,6 +66,9 @@ parser.add_argument('--imbalancetype', type=str, default='long', help='Long tail
 parser.add_argument('--unlabeledratio', type=float, default=2, help='Long tailed or step imbalanced')
 parser.add_argument('--debiasstart', type=int, default=100, help='Long tailed or step imbalanced')
 
+parser.add_argument('--lambda_bias', type=float, default=0.1,
+                    help='weight for baseline consistency regularization')
+
 
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
@@ -241,6 +244,17 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
                 outputs_u = outputs_u - biaseddegree.detach()
             targets_u2 = F.softmax(outputs_u).detach()
 
+        # —— 新增：基线一致性正则化 L_bias ——
+        blank = torch.ones((1, 3, 32, 32)).cuda()
+        logits_blank, _ = model(blank)  # [1, C]
+        if logits_blank.dim() == 1:
+            logits_blank = logits_blank.unsqueeze(0)
+        p_blank = F.softmax(logits_blank, dim=1)  # [1, C]
+        uniform = torch.full_like(p_blank, 1.0 / num_class)  # [1, C]
+        # 计算 KL(p_blank || uniform)，或用 L2 形式都可
+        L_bias = torch.sum(p_blank * torch.log(p_blank / uniform), dim=1).mean()
+        # —— end ——
+
 
         max_p, p_hat = torch.max(targets_u2, dim=1)
         p_hat = torch.zeros(int(args.unlabeledratio*batch_size), num_class).cuda().scatter_(1, p_hat.view(-1, 1), 1)
@@ -261,7 +275,9 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
 
         Lx, Lu = criterion(logits_x,all_targets[:batch_size], logits_u, all_targets[batch_size:], select_mask)
 
-        loss=Lx+Lu
+        # loss=Lx+Lu
+        loss = Lx + Lu + args.lambda_bias * L_bias
+
         losses.update(loss.item(), inputs_x.size(0))
         losses_x.update(Lx.item(), inputs_x.size(0))
         losses_u.update(Lu.item(), inputs_x.size(0))
