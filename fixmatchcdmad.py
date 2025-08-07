@@ -86,6 +86,11 @@ parser.add_argument('--alpha_adv', type=float, default=0.1,
 parser.add_argument('--beta_bias', type=float, default=1.0,
                     help='weight for bias-net fitting loss')
 
+parser.add_argument('--grl-lambda', type=float, default=0.1,
+                    help='GRL 的梯度翻转系数 λ')
+parser.add_argument('--adv-weight', type=float, default=0.1,
+                    help='对抗损失在总 loss 中的权重 w_adv')
+
 
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
@@ -197,7 +202,7 @@ def main():
 
         # train(labeled_trainloader,unlabeled_trainloader,model, optimizer,ema_optimizer,train_criterion,epoch)
         train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_optimizer, train_criterion,
-              bias_net, bias_optimizer, args.alpha_adv, args.beta_bias, epoch)
+              bias_net, bias_optimizer, args.grl_lambda, args.adv_weight, args.beta_bias, epoch)
 
         test_acc1, testclassacc1, test_acc2, testclassacc2= validate(test_loader, ema_model,criterion,mode='Test Stats ')
         GM = 1
@@ -229,7 +234,7 @@ def main():
     logger.close()
 # def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimizer, criterion, epoch):
 def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_optimizer, criterion,
-           bias_net, bias_optimizer, alpha_adv, beta_bias, epoch):
+           bias_net, bias_optimizer, grl_lambda, adv_weight, beta_bias, epoch):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -309,22 +314,25 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
         # 内容网络做一次纯色图的前向
         # logits_c_base, feat_c_base, _ = model(white)
         # —— 冻结 BN 统计 ——
-        model.eval()  # 关闭 Dropout & BN 跟新，只用已有 running stats
-        # 注意：此处不使用 torch.no_grad()，需保留梯度流
-        logits_c_base, feat_c_base, _ = model(white)
-        model.train()  # 恢复训练模式，后续 minibatch 正常更新 BN
-        # bias_net 经 GRL
-        adv_pred = bias_net(grl(feat_c_base, lambd=alpha_adv))
-        P = F.softmax(logits_c_base, dim=1)
-        Q = F.softmax(adv_pred, dim=1)
-        # KL(P || Q) = Σ P log(P/Q)
-        loss_adv = torch.sum(P * (torch.log(P + 1e-8) - torch.log(Q + 1e-8)), dim=1).mean()
-        # 加到主 loss 上
+
 
         Lx, Lu = criterion(logits_x,all_targets[:batch_size], logits_u, all_targets[batch_size:], select_mask)
 
+        if epoch > args.debiasstart:
+            # 冻结 BN 统计
+            model.eval()
+            logits_base, feat_base, _ = model(white)
+            model.train()
+            # GRL 翻转
+            adv_pred = bias_net(grl(feat_base, lambd=grl_lambda))
+            P = F.softmax(logits_base, dim=1)
+            Q = F.softmax(adv_pred, dim=1)
+            loss_adv = torch.sum(P * (torch.log(P + 1e-8) - torch.log(Q + 1e-8)), dim = 1).mean()
+            loss = Lx + Lu + adv_weight * loss_adv
+        else:
+            # 预热期仅用 FixMatch 原始损失
+            loss = Lx + Lu
         # loss=Lx+Lu
-        loss=Lx+Lu+alpha_adv * loss_adv
 
         losses.update(loss.item(), inputs_x.size(0))
         losses_x.update(Lx.item(), inputs_x.size(0))
