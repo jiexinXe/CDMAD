@@ -24,6 +24,21 @@ import torch.nn.functional as F
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
 from scipy import optimize
 
+import torch.nn as nn
+from torch.autograd import Function
+
+class GradientReversal(Function):
+    @staticmethod
+    def forward(ctx, x, lambd):
+        ctx.lambd = lambd
+        return x.clone()
+    @staticmethod
+    def backward(ctx, grad):
+        return grad.neg() * ctx.lambd, None
+
+def grl(x, lambd=1.0):
+    return GradientReversal.apply(x, lambd)
+
 parser = argparse.ArgumentParser(description='PyTorch fixMatch Training')
 # Optimization options
 parser.add_argument('--epochs', default=500, type=int, metavar='N',
@@ -56,7 +71,7 @@ parser.add_argument('--step', action='store_true', help='Type of class-imbalance
 parser.add_argument('--val-iteration', type=int, default=500,
                         help='Frequency for the evaluation')
 
-parser.add_argument('--tau', default=0, type=float, help='hyper-parameter for pseudo-label of FixMatch')
+parser.add_argument('--tau', default=0.95, type=float, help='hyper-parameter for pseudo-label of FixMatch')
 parser.add_argument('--ema-decay', default=0.999, type=float)
 parser.add_argument('--wd', default=0.04, type=float)
 
@@ -65,6 +80,11 @@ parser.add_argument('--dataset', type=str, default='cifar10', help='Dataset')
 parser.add_argument('--imbalancetype', type=str, default='long', help='Long tailed or step imbalanced')
 parser.add_argument('--unlabeledratio', type=float, default=2, help='Long tailed or step imbalanced')
 parser.add_argument('--debiasstart', type=int, default=100, help='Long tailed or step imbalanced')
+
+parser.add_argument('--alpha_adv', type=float, default=0.1,
+                    help='weight for adversarial loss on content network')
+parser.add_argument('--beta_bias', type=float, default=1.0,
+                    help='weight for bias-net fitting loss')
 
 
 args = parser.parse_args()
@@ -135,6 +155,15 @@ def main():
         return model, params
 
     model, params = create_model()
+
+    # —— 新增：偏置网络（共享 backbone 特征） ——
+    # 用一次“白图”前向跑出 feature 维度：
+    white = torch.ones((1, 3, 32, 32)).cuda()
+    logits_base, feat, _ = model(white)
+    feat_dim = feat.size(1)
+    bias_net = nn.Linear(feat_dim, num_class).cuda()
+    bias_optimizer = optim.Adam(bias_net.parameters(), lr=args.lr)
+
     ema_model,  _ = create_model(ema=True)
 
     cudnn.benchmark = True
@@ -166,7 +195,9 @@ def main():
         print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
 
 
-        train(labeled_trainloader,unlabeled_trainloader,model, optimizer,ema_optimizer,train_criterion,epoch)
+        # train(labeled_trainloader,unlabeled_trainloader,model, optimizer,ema_optimizer,train_criterion,epoch)
+        train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_optimizer, train_criterion,
+              bias_net, bias_optimizer, args.alpha_adv, args.beta_bias, epoch)
 
         test_acc1, testclassacc1, test_acc2, testclassacc2= validate(test_loader, ema_model,criterion,mode='Test Stats ')
         GM = 1
@@ -196,7 +227,9 @@ def main():
             }, epoch + 1)
 
     logger.close()
-def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimizer, criterion, epoch):
+# def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimizer, criterion, epoch):
+def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_optimizer, criterion,
+           bias_net, bias_optimizer, alpha_adv, beta_bias, epoch):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -207,6 +240,19 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
     bar = Bar('Training', max=args.val_iteration)
     labeled_train_iter = iter(labeled_trainloader)
     unlabeled_train_iter = iter(unlabeled_trainloader)
+
+    # —— Bias Net 先验拟合 ——
+    model.eval()
+    with torch.no_grad():
+        white = torch.ones((1, 3, 32, 32)).cuda()
+        base_logits, base_feat, _ = model(white)
+        base_prob = F.softmax(base_logits, dim=1)
+    bias_net.train()
+    bias_optimizer.zero_grad()
+    pred_bias = bias_net(base_feat)  # g_phi(base_feat)
+    loss_bias = F.mse_loss(F.softmax(pred_bias, dim=1), base_prob)
+    (beta_bias * loss_bias).backward()
+    bias_optimizer.step()
 
     model.train()
 
@@ -235,10 +281,10 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
 
         with torch.no_grad():
             white = torch.ones((1, 3, 32, 32)).cuda()
-            biaseddegree, _ = model(white)
-            outputs_u, _ = model(inputs_u)
-            if epoch>args.debiasstart:
-                outputs_u = outputs_u - biaseddegree.detach()
+            biaseddegree, _, _ = model(white)
+            outputs_u, _, _ = model(inputs_u)
+            # if epoch>args.debiasstart:
+            #     outputs_u = outputs_u - biaseddegree.detach()
             targets_u2 = F.softmax(outputs_u).detach()
 
 
@@ -253,15 +299,33 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
         all_targets = torch.cat([targets_x2, targets_u2, targets_u2], dim=0)
 
 
-        logits_x,_= model(inputs_x)
-        logits_u2,_ = model(inputs_u2)
-        logits_u3,_ = model(inputs_u3)
+        logits_x,_, _= model(inputs_x)
+        logits_u2,_,_ = model(inputs_u2)
+        logits_u3,_,_ = model(inputs_u3)
 
         logits_u = torch.cat([logits_u2,logits_u3],dim=0)
 
+        # —— Adversarial Loss on content network ——
+        # 内容网络做一次纯色图的前向
+        # logits_c_base, feat_c_base, _ = model(white)
+        # —— 冻结 BN 统计 ——
+        model.eval()  # 关闭 Dropout & BN 跟新，只用已有 running stats
+        # 注意：此处不使用 torch.no_grad()，需保留梯度流
+        logits_c_base, feat_c_base, _ = model(white)
+        model.train()  # 恢复训练模式，后续 minibatch 正常更新 BN
+        # bias_net 经 GRL
+        adv_pred = bias_net(grl(feat_c_base, lambd=alpha_adv))
+        P = F.softmax(logits_c_base, dim=1)
+        Q = F.softmax(adv_pred, dim=1)
+        # KL(P || Q) = Σ P log(P/Q)
+        loss_adv = torch.sum(P * (torch.log(P + 1e-8) - torch.log(Q + 1e-8)), dim=1).mean()
+        # 加到主 loss 上
+
         Lx, Lu = criterion(logits_x,all_targets[:batch_size], logits_u, all_targets[batch_size:], select_mask)
 
-        loss=Lx+Lu
+        # loss=Lx+Lu
+        loss=Lx+Lu+alpha_adv * loss_adv
+
         losses.update(loss.item(), inputs_x.size(0))
         losses_x.update(Lx.item(), inputs_x.size(0))
         losses_u.update(Lu.item(), inputs_x.size(0))
@@ -315,14 +379,14 @@ def validate(valloader,model,criterion,mode):
     with torch.no_grad():
 
         white = torch.ones(1,3, 32, 32).cuda()
-        biaseddegree, _ = model(white)
+        biaseddegree, _, _ = model(white)
         for batch_idx, (inputs, targets, _) in enumerate(valloader):
 
             data_time.update(time.time() - end)
             inputs, targets = inputs.cuda(), targets.cuda(non_blocking=True)
             # compute output
             targetsonehot = torch.zeros(inputs.size()[0], num_class).scatter_(1, targets.cpu().view(-1, 1).long(), 1)
-            outputs,_=model(inputs)
+            outputs,_,_=model(inputs)
             outputs2=outputs-biaseddegree
 
             score = F.softmax(outputs)

@@ -96,16 +96,15 @@ class WRN(nn.Module):
         x = self.unit2(x)
         x = self.unit3(x)
         f = self.unit4(x)
-        c = self.output(f.squeeze())
-        if self.rotation:
-            r = self.rot(f.squeeze())
-        else:
-            r = 0
-            
-        if return_feature:
-            return [c, r, f]
-        else:
-            return c, r
+        # 1) 全局池化并拉平
+        feat = f.view(f.size(0), -1)  # [B, D]
+        # 2) 分类 logits
+        logits = self.output(feat)  # [B, num_classes]
+        # 3) （可选）旋转分支
+        rot = self.rot(feat) if self.rotation else None
+        # 4) 返回 logits、特征向量 和 旋转（可为 None）
+
+        return logits, feat, rot
 
     def update_batch_stats(self, flag):
         for m in self.modules():
