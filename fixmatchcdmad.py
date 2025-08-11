@@ -56,7 +56,7 @@ parser.add_argument('--step', action='store_true', help='Type of class-imbalance
 parser.add_argument('--val-iteration', type=int, default=500,
                         help='Frequency for the evaluation')
 
-parser.add_argument('--tau', default=0, type=float, help='hyper-parameter for pseudo-label of FixMatch')
+parser.add_argument('--tau', default=0.95, type=float, help='hyper-parameter for pseudo-label of FixMatch')
 parser.add_argument('--ema-decay', default=0.999, type=float)
 parser.add_argument('--wd', default=0.04, type=float)
 
@@ -66,6 +66,8 @@ parser.add_argument('--imbalancetype', type=str, default='long', help='Long tail
 parser.add_argument('--unlabeledratio', type=float, default=2, help='Long tailed or step imbalanced')
 parser.add_argument('--debiasstart', type=int, default=100, help='Long tailed or step imbalanced')
 
+parser.add_argument('--alpha', type=float, default=1.0,
+                    help='baseline regularization strength (α)')
 
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
@@ -137,6 +139,18 @@ def main():
     model, params = create_model()
     ema_model,  _ = create_model(ema=True)
 
+    # ——— 计算 Baseline logits b ———
+    model.eval()
+    with torch.no_grad():
+        # 这里用一张纯白图；也可用多张 I_j 平均
+        # white = torch.ones((1, 3, 32, 32)).cuda()
+        # b_full, _ = model(white)  # b_full: [1, C]
+        black = torch.zeros((1, 3, 32, 32)).cuda()
+        b_full, _ = model(black)
+    b = b_full.squeeze(0)  # b: [C]
+    args.b = b
+    model.train()
+
     cudnn.benchmark = True
     print('    Total params: %.2fM' % (sum(p.numel() for p in params) / 1000000.0))
 
@@ -165,6 +179,18 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
 
+        # ——— 动态更新 baseline b ———
+        if (epoch % 5) == 0:
+            model.eval()
+            with torch.no_grad():
+                # white = torch.ones((1, 3, 32, 32)).cuda()
+                # b_full, _ = model(white)
+                black = torch.zeros((1, 3, 32, 32)).cuda()
+                b_full, _ = model(black)
+                args.b = b_full.squeeze(0)
+        model.train()
+
+        print('\nEpoch: [%d | %d] LR: %f | updated b at epoch %d' % (epoch + 1, args.epochs, state['lr'], epoch))
 
         train(labeled_trainloader,unlabeled_trainloader,model, optimizer,ema_optimizer,train_criterion,epoch)
 
@@ -233,13 +259,18 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
         inputs_x,targets_x2 = inputs_x.cuda(),targets_x2.cuda(non_blocking=True)
         inputs_u, inputs_u2, inputs_u3  = inputs_u.cuda(), inputs_u2.cuda(), inputs_u3.cuda()
 
+        # with torch.no_grad():
+        #     white = torch.ones((1, 3, 32, 32)).cuda()
+        #     biaseddegree, _ = model(white)
+        #     outputs_u, _ = model(inputs_u)
+        #     if epoch>args.debiasstart:
+        #         outputs_u = outputs_u - biaseddegree.detach()
+        #     targets_u2 = F.softmax(outputs_u).detach()
+
         with torch.no_grad():
-            white = torch.ones((1, 3, 32, 32)).cuda()
-            biaseddegree, _ = model(white)
-            outputs_u, _ = model(inputs_u)
-            if epoch>args.debiasstart:
-                outputs_u = outputs_u - biaseddegree.detach()
-            targets_u2 = F.softmax(outputs_u).detach()
+            outputs_u, _ = model(inputs_u)  # [Bu, C]
+            outputs_u = outputs_u - args.alpha * args.b  # BRCE 减偏
+            targets_u2 = F.softmax(outputs_u).detach()  # 伪标签
 
 
         max_p, p_hat = torch.max(targets_u2, dim=1)
@@ -253,11 +284,22 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
         all_targets = torch.cat([targets_x2, targets_u2, targets_u2], dim=0)
 
 
-        logits_x,_= model(inputs_x)
-        logits_u2,_ = model(inputs_u2)
-        logits_u3,_ = model(inputs_u3)
+        # logits_x,_= model(inputs_x)
+        # logits_u2,_ = model(inputs_u2)
+        # logits_u3,_ = model(inputs_u3)
+        #
+        # logits_u = torch.cat([logits_u2,logits_u3],dim=0)
 
-        logits_u = torch.cat([logits_u2,logits_u3],dim=0)
+        # ——— 原始 logits ———
+        logits_x, _ = model(inputs_x)  # [B, C]
+        logits_u2, _ = model(inputs_u2)  # [Bu, C]
+        logits_u3, _ = model(inputs_u3)  # [Bu, C]
+        # ——— Baseline-Regularized CE：统一去偏 ———
+        logits_x = logits_x - args.alpha * args.b
+        logits_u2 = logits_u2 - args.alpha * args.b
+        logits_u3 = logits_u3 - args.alpha * args.b
+        # 合并无标签分支
+        logits_u = torch.cat([logits_u2, logits_u3], dim=0)
 
         Lx, Lu = criterion(logits_x,all_targets[:batch_size], logits_u, all_targets[batch_size:], select_mask)
 
@@ -314,19 +356,34 @@ def validate(valloader,model,criterion,mode):
 
     with torch.no_grad():
 
-        white = torch.ones(1,3, 32, 32).cuda()
-        biaseddegree, _ = model(white)
+        # white = torch.ones(1,3, 32, 32).cuda()
+        # biaseddegree, _ = model(white)
+        # —— 用“评估用的模型”现算 b_eval（评估自洽）——
+        # white = torch.ones(1, 3, 32, 32).cuda()
+        # b_eval, _ = model(white)
+        black = torch.zeros((1, 3, 32, 32)).cuda()
+        b_eval, _ = model(black)
+        b_eval = b_eval.squeeze(0)  # [C]
         for batch_idx, (inputs, targets, _) in enumerate(valloader):
 
             data_time.update(time.time() - end)
             inputs, targets = inputs.cuda(), targets.cuda(non_blocking=True)
             # compute output
             targetsonehot = torch.zeros(inputs.size()[0], num_class).scatter_(1, targets.cpu().view(-1, 1).long(), 1)
-            outputs,_=model(inputs)
-            outputs2=outputs-biaseddegree
+            # outputs,_=model(inputs)
+            # outputs2=outputs-biaseddegree
 
-            score = F.softmax(outputs)
-            score2 = F.softmax(outputs2)
+            outputs, _ = model(inputs)
+            # 带去偏／不带去偏的 logits
+            # outputs_debiased = outputs - args.alpha * args.b
+            outputs_debiased = outputs - args.alpha * b_eval
+
+            # 如果需要对比，可保留：
+            score = F.softmax(outputs, dim=1)
+            score2 = F.softmax(outputs_debiased, dim=1)
+
+            # score = F.softmax(outputs)
+            # score2 = F.softmax(outputs2)
 
 
             prediction=torch.argmax(score,dim=1)
@@ -342,7 +399,8 @@ def validate(valloader,model,criterion,mode):
 
             # measure accuracy and record loss
             prec1, prec5 = accuracy(outputs, targets, topk=(1, 5))
-            prec1debias, prec5debias = accuracy(outputs2, targets, topk=(1, 5))
+            # prec1debias, prec5debias = accuracy(outputs2, targets, topk=(1, 5))
+            prec1debias, prec5debias = accuracy(outputs_debiased, targets, topk=(1, 5))
             top1.update(prec1.item(), inputs.size(0))
             top5.update(prec5.item(), inputs.size(0))
             top1debias.update(prec1debias.item(), inputs.size(0))
