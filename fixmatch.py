@@ -23,6 +23,184 @@ import torchvision.transforms as transforms
 import torch.nn.functional as F
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
 from scipy import optimize
+import csv
+import contextlib
+
+# ---------------- Diagnostics utilities ----------------
+DIAG_FIELDS = [
+    "epoch","iter","lr",
+    "probe_mode","probe_types","probe_ref",
+    "b_entropy","b_kl_uniform","b_l2","b_ema_l2_delta",
+    "probe_jsd_avg_vs_ref",
+    "accept_rate_raw","accept_rate_debias","flip_rate_raw_vs_debias",
+    "pl_head_mass_raw","pl_tail_mass_raw","pl_head_tail_ratio_raw",
+    "pl_head_mass_debias","pl_tail_mass_debias","pl_head_tail_ratio_debias",
+    "bn_drift_l2"
+]
+DIAG_F = None
+DIAG_WRITER = None
+PROBE_EMA = None  # torch tensor [C]
+
+# These will be set in main()
+CLASS_COUNTS_L = None  # np.ndarray [C]
+HEAD_MASK = None       # torch.BoolTensor [C] on CPU
+TAIL_MASK = None       # torch.BoolTensor [C] on CPU
+
+def _safe_log(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    return torch.log(x.clamp_min(eps))
+
+def entropy_from_logits(logits_1d: torch.Tensor) -> float:
+    # Entropy in nats for logits [C]
+    p = F.softmax(logits_1d, dim=-1)
+    h = -(p * _safe_log(p)).sum()
+    return float(h.item())
+
+def kl_to_uniform_from_logits(logits_1d: torch.Tensor) -> float:
+    # KL(softmax(logits) || Uniform)
+    c = logits_1d.numel()
+    h = entropy_from_logits(logits_1d)
+    return float(math.log(c) - h)
+
+def js_divergence(p: torch.Tensor, q: torch.Tensor) -> float:
+    # Jensen-Shannon divergence for prob vectors p,q
+    m = 0.5 * (p + q)
+    kl_pm = (p * (_safe_log(p) - _safe_log(m))).sum()
+    kl_qm = (q * (_safe_log(q) - _safe_log(m))).sum()
+    js = 0.5 * (kl_pm + kl_qm)
+    return float(js.item())
+
+def bn_snapshot(model: nn.Module):
+    stats = []
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d) and getattr(m, "track_running_stats", False):
+            if m.running_mean is not None:
+                stats.append(m.running_mean.detach().clone())
+            if m.running_var is not None:
+                stats.append(m.running_var.detach().clone())
+    return stats
+
+def bn_drift_l2(before, after) -> float:
+    if not before or not after:
+        return 0.0
+    s = 0.0
+    for a, b in zip(after, before):
+        s += (a.float() - b.float()).pow(2).sum().item()
+    return float(math.sqrt(s))
+
+def _probe_parse_list(s: str):
+    items = [x.strip().lower() for x in s.split(",") if x.strip()]
+    return items if items else ["white"]
+
+def make_probe_like(x_ref: torch.Tensor, kind: str) -> torch.Tensor:
+    # Construct a probe image in the same input space as x_ref (already preprocessed).
+    kind = kind.lower()
+    B, C, H, W = x_ref.shape
+    ch_mean = x_ref.mean(dim=(0,2,3), keepdim=True)   # [1,C,1,1]
+    ch_min  = x_ref.amin(dim=(0,2,3), keepdim=True)
+    ch_max  = x_ref.amax(dim=(0,2,3), keepdim=True)
+
+    # Constant probes (legacy-style, independent of batch stats)
+    if kind in ("const1","ones"):
+        base = torch.ones_like(ch_mean)
+    elif kind in ("const0","zeros"):
+        base = torch.zeros_like(ch_mean)
+    elif kind in ("const05","half"):
+        base = 0.5 * torch.ones_like(ch_mean)
+    elif kind == "mean":
+        base = ch_mean
+    elif kind == "zero":
+        base = torch.zeros_like(ch_mean)
+    elif kind == "white":
+        base = ch_max
+    elif kind == "black":
+        base = ch_min
+    elif kind == "gray":
+        base = 0.5 * (ch_min + ch_max)
+    elif kind in ("red","green","blue") and C >= 3:
+        base = ch_min.clone()
+        if kind == "red":
+            base[:,0:1] = ch_max[:,0:1]
+        elif kind == "green":
+            base[:,1:2] = ch_max[:,1:2]
+        else:
+            base[:,2:3] = ch_max[:,2:3]
+    else:
+        base = ch_mean
+
+    return base.expand(1, C, H, W).contiguous()
+
+@contextlib.contextmanager
+def _temporary_eval(model: nn.Module):
+    was_training = model.training
+    try:
+        model.eval()
+        yield
+    finally:
+        if was_training:
+            model.train()
+
+def forward_probe_logits(model: nn.Module, x_probe: torch.Tensor, probe_mode: str) -> torch.Tensor:
+    # Return logits [C] for a single probe image.
+    probe_mode = probe_mode.lower()
+    if probe_mode == "eval":
+        with _temporary_eval(model):
+            with torch.inference_mode():
+                logits, _ = model(x_probe)
+    else:
+        # train mode (may update BN running stats!)
+        with torch.inference_mode():
+            logits, _ = model(x_probe)
+    return logits.squeeze(0)
+
+def diag_init(out_dir: str):
+    global DIAG_F, DIAG_WRITER
+    if not args.diag_enable:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, args.diag_file)
+    is_new = (not os.path.exists(path)) or (os.path.getsize(path) == 0)
+    DIAG_F = open(path, "a", newline="")
+    DIAG_WRITER = csv.DictWriter(DIAG_F, fieldnames=DIAG_FIELDS)
+    if is_new:
+        DIAG_WRITER.writeheader()
+        DIAG_F.flush()
+
+def diag_close():
+    global DIAG_F, DIAG_WRITER
+    try:
+        if DIAG_F is not None:
+            DIAG_F.flush()
+            DIAG_F.close()
+    finally:
+        DIAG_F = None
+        DIAG_WRITER = None
+
+def diag_write(row: dict):
+    if (not args.diag_enable) or (DIAG_WRITER is None):
+        return
+    for k in DIAG_FIELDS:
+        row.setdefault(k, "")
+    DIAG_WRITER.writerow(row)
+    DIAG_F.flush()
+
+def _head_tail_masks_from_counts(counts_np: np.ndarray):
+    c = len(counts_np)
+    k = max(1, int(round(0.3 * c)))
+    idx = np.argsort(-counts_np)  # descending
+    head_idx = idx[:k]
+    tail_idx = idx[-k:]
+    head_mask = torch.zeros(c, dtype=torch.bool)
+    tail_mask = torch.zeros(c, dtype=torch.bool)
+    head_mask[torch.tensor(head_idx, dtype=torch.long)] = True
+    tail_mask[torch.tensor(tail_idx, dtype=torch.long)] = True
+    return head_mask, tail_mask
+
+def _mass_ratio_from_counts(counts: torch.Tensor, head_mask: torch.Tensor, tail_mask: torch.Tensor):
+    total = counts.sum().float().clamp_min(1.0)
+    head = counts[head_mask].sum().float() / total
+    tail = counts[tail_mask].sum().float() / total
+    ratio = (head + 1e-12) / (tail + 1e-12)
+    return float(head.item()), float(tail.item()), float(ratio.item())
 
 parser = argparse.ArgumentParser(description='PyTorch fixMatch Training')
 # Optimization options
@@ -65,6 +243,29 @@ parser.add_argument('--dataset', type=str, default='cifar10', help='Dataset')
 parser.add_argument('--imbalancetype', type=str, default='long', help='Long tailed or step imbalanced')
 parser.add_argument('--unlabeledratio', type=float, default=2, help='Long tailed or step imbalanced')
 parser.add_argument('--debiasstart', type=int, default=100, help='Long tailed or step imbalanced')
+# ---------------- Diagnostics / Probe settings (baseline picture study) ----------------
+parser.add_argument('--diag', dest='diag_enable', action='store_true',
+                    help='Enable diagnostics logging for baseline picture / bias probe')
+parser.add_argument('--no-diag', dest='diag_enable', action='store_false',
+                    help='Disable diagnostics logging')
+parser.set_defaults(diag_enable=True)
+
+parser.add_argument('--diag-freq', type=int, default=50,
+                    help='Log diagnostics every N iterations (default: 50)')
+parser.add_argument('--diag-file', type=str, default='diag_metrics.csv',
+                    help='Diagnostics CSV filename saved under --out')
+parser.add_argument('--probe-mode', type=str, default='eval', choices=['eval', 'train'],
+                    help='Compute probe logits in eval() (no BN update) or train() mode (will update BN). '
+                         'Use eval for normal training; train is only for back-action experiments.')
+parser.add_argument('--probe-types', type=str, default='white,black,gray',
+                    help='Comma-separated probe types to evaluate, e.g. "const1,const0,const05,white,black,gray,mean,red,green,blue". '
+                         'Probes are constructed in the same input space as the current batch.')
+parser.add_argument('--probe-ref', type=str, default='white',
+                    help='Which probe in --probe-types to use as the main debias reference (default: white)')
+parser.add_argument('--probe-ema', type=float, default=0.99,
+                    help='EMA factor for probe logits stability tracking (default: 0.99)')
+parser.add_argument('--log-bn-drift', action='store_true',
+                    help='If set, log BN running stats drift caused by probe forward (useful when --probe-mode=train)')
 
 
 args = parser.parse_args()
@@ -103,6 +304,13 @@ def main():
 
     N_SAMPLES_PER_CLASS = make_imb_data(args.num_max, num_class, args.imb_ratio,args.imbalancetype)
     U_SAMPLES_PER_CLASS = make_imb_data(args.num_max_u, num_class, args.imb_ratio_u,args.imbalancetype)
+    # ---- Diagnostics globals ----
+    global CLASS_COUNTS_L, HEAD_MASK, TAIL_MASK
+    CLASS_COUNTS_L = np.array(N_SAMPLES_PER_CLASS, dtype=np.int64)
+    HEAD_MASK, TAIL_MASK = _head_tail_masks_from_counts(CLASS_COUNTS_L)
+
+    # Init diagnostics CSV
+    diag_init(args.out)
 
     if np.array(N_SAMPLES_PER_CLASS).sum()+np.array(U_SAMPLES_PER_CLASS).sum() >= 30000 or args.dataset == 'stl10':
         args.wd=0.01
@@ -161,7 +369,7 @@ def main():
         logger = Logger(os.path.join(args.out, 'log.txt'), title=title, resume=True)
     else:
         logger = Logger(os.path.join(args.out, 'log.txt'), title=title)
-        logger.set_names(['Train Loss', 'Train Loss X', 'Train Loss U', 'Test Loss', 'Test Acc.'])
+        logger.set_names(['bACC_raw','GM_raw','bACC_debias','GM_debias','top1_raw','top1_debias'])
     for epoch in range(start_epoch, args.epochs):
         print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
 
@@ -184,8 +392,8 @@ def main():
             else:
                 GM2 *= (testclassacc2[i]) ** (1 / num_class)
 
-        print( "without test debias bACC:",testclassacc1.mean(),"GM:",GM,"with test debias bACC:",testclassacc2.mean(),"GM",GM2)
-        logger.append([testclassacc1.mean(), GM, testclassacc2.mean(), GM2, testclassacc1.mean()])
+        print("raw: top1:", test_acc1, "bACC:", testclassacc1.mean(), "GM:", GM, "| debias: top1:", test_acc2, "bACC:", testclassacc2.mean(), "GM:", GM2)
+        logger.append([testclassacc1.mean(), GM, testclassacc2.mean(), GM2, test_acc1, test_acc2])
 
         save_checkpoint({
                 'epoch': epoch + 1,
@@ -233,13 +441,40 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
         inputs_x,targets_x2 = inputs_x.cuda(),targets_x2.cuda(non_blocking=True)
         inputs_u, inputs_u2, inputs_u3  = inputs_u.cuda(), inputs_u2.cuda(), inputs_u3.cuda()
 
+
+        # ---------------- Probe / bias estimate (CDMAD-style) ----------------
+        probe_kinds = _probe_parse_list(args.probe_types)
+        probe_ref = args.probe_ref.lower() if args.probe_ref.lower() in probe_kinds else probe_kinds[0]
+
+        # Optional BN drift measurement (only meaningful for probe_mode=train)
+        bn_drift = 0.0
+        bn_before = None
+        if args.diag_enable and args.log_bn_drift and args.probe_mode.lower() == "train" and (batch_idx % args.diag_freq == 0):
+            bn_before = bn_snapshot(model)
+
         with torch.no_grad():
-            white = torch.ones((1, 3, 32, 32)).cuda()
-            biaseddegree, _ = model(white)
-            outputs_u, _ = model(inputs_u)
-            if epoch>args.debiasstart:
-                outputs_u = outputs_u - biaseddegree.detach()
-            targets_u2 = F.softmax(outputs_u).detach()
+            # 1) Compute probe logits for each probe kind (in the same input space as current batch)
+            probe_logits = {}
+            for k in probe_kinds:
+                x_probe = make_probe_like(inputs_u, k)
+                probe_logits[k] = forward_probe_logits(model, x_probe, args.probe_mode)
+
+            # BN drift after probes
+            if bn_before is not None:
+                bn_after = bn_snapshot(model)
+                bn_drift = bn_drift_l2(bn_before, bn_after)
+
+            # Main bias vector b (logits) used for debias
+            b_logits = probe_logits[probe_ref].detach()  # [C]
+
+            # 2) Unlabeled weak logits (raw & debiased for diagnostics)
+            outputs_u_raw, _ = model(inputs_u)
+            outputs_u_debias = outputs_u_raw
+            if epoch > args.debiasstart:
+                outputs_u_debias = outputs_u_raw - b_logits.view(1, -1)
+
+            targets_u_raw = F.softmax(outputs_u_raw, dim=1).detach()
+            targets_u2 = F.softmax(outputs_u_debias, dim=1).detach()
 
 
         max_p, p_hat = torch.max(targets_u2, dim=1)
@@ -247,6 +482,69 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
         select_mask = max_p.ge(args.tau)
 
         select_mask = torch.cat([select_mask, select_mask], 0).float()
+
+        # ---------------- Diagnostics logging (periodic) ----------------
+        if args.diag_enable and (batch_idx % args.diag_freq == 0):
+            global PROBE_EMA
+            b_entropy = entropy_from_logits(b_logits)
+            b_kl_u = kl_to_uniform_from_logits(b_logits)
+            b_l2 = float(torch.norm(b_logits, p=2).item())
+
+            # EMA stability of b
+            if PROBE_EMA is None:
+                PROBE_EMA = b_logits.detach().clone()
+            else:
+                PROBE_EMA = args.probe_ema * PROBE_EMA + (1.0 - args.probe_ema) * b_logits.detach()
+            b_ema_delta = float(torch.norm((b_logits.detach() - PROBE_EMA), p=2).item())
+
+            # Probe sensitivity: average JS divergence vs ref
+            p_ref = F.softmax(probe_logits[probe_ref], dim=-1)
+            js_vals = []
+            for k in probe_kinds:
+                if k == probe_ref:
+                    continue
+                pk = F.softmax(probe_logits[k], dim=-1)
+                js_vals.append(js_divergence(p_ref, pk))
+            js_avg = float(np.mean(js_vals)) if len(js_vals) > 0 else 0.0
+
+            # Acceptance & flip diagnostics (raw vs debiased)
+            max_p_raw, y_raw = torch.max(targets_u_raw, dim=1)
+            max_p_deb, y_deb = torch.max(targets_u2, dim=1)
+            accept_raw = float(max_p_raw.ge(args.tau).float().mean().item())
+            accept_deb = float(max_p_deb.ge(args.tau).float().mean().item())
+            flip_rate = float((y_raw != y_deb).float().mean().item())
+
+            # Mass on head/tail classes
+            counts_raw = torch.bincount(y_raw, minlength=num_class)
+            counts_deb = torch.bincount(y_deb, minlength=num_class)
+            h_raw, t_raw, r_raw = _mass_ratio_from_counts(counts_raw.cpu(), HEAD_MASK, TAIL_MASK)
+            h_deb, t_deb, r_deb = _mass_ratio_from_counts(counts_deb.cpu(), HEAD_MASK, TAIL_MASK)
+
+            lr = optimizer.param_groups[0]['lr'] if len(optimizer.param_groups) > 0 else 0.0
+
+            diag_write({
+                "epoch": epoch,
+                "iter": batch_idx,
+                "lr": lr,
+                "probe_mode": args.probe_mode,
+                "probe_types": args.probe_types,
+                "probe_ref": probe_ref,
+                "b_entropy": b_entropy,
+                "b_kl_uniform": b_kl_u,
+                "b_l2": b_l2,
+                "b_ema_l2_delta": b_ema_delta,
+                "probe_jsd_avg_vs_ref": js_avg,
+                "accept_rate_raw": accept_raw,
+                "accept_rate_debias": accept_deb,
+                "flip_rate_raw_vs_debias": flip_rate,
+                "pl_head_mass_raw": h_raw,
+                "pl_tail_mass_raw": t_raw,
+                "pl_head_tail_ratio_raw": r_raw,
+                "pl_head_mass_debias": h_deb,
+                "pl_tail_mass_debias": t_deb,
+                "pl_head_tail_ratio_debias": r_deb,
+                "bn_drift_l2": bn_drift
+            })
 
         #all_targets = torch.cat([targets_x2, p_hat, p_hat], dim=0)
         #else:
@@ -314,8 +612,16 @@ def validate(valloader,model,criterion,mode):
 
     with torch.no_grad():
 
-        white = torch.ones(1,3, 32, 32).cuda()
-        biaseddegree, _ = model(white)
+
+        # Build a probe aligned to validation input space using the first batch
+        probe_kinds = _probe_parse_list(args.probe_types)
+        probe_ref = args.probe_ref.lower() if args.probe_ref.lower() in probe_kinds else probe_kinds[0]
+
+        first_batch = next(iter(valloader))
+        x_ref = first_batch[0].cuda(non_blocking=True) if isinstance(first_batch, (list, tuple)) else first_batch.cuda(non_blocking=True)
+        x_probe = make_probe_like(x_ref, probe_ref)
+
+        biaseddegree = forward_probe_logits(model, x_probe, "eval").view(1, -1)
         for batch_idx, (inputs, targets, _) in enumerate(valloader):
 
             data_time.update(time.time() - end)
@@ -458,4 +764,7 @@ def interleave(xy, batch):
     return [torch.cat(v, dim=0) for v in xy]
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    finally:
+        diag_close()
