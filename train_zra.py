@@ -734,8 +734,8 @@ def validate(valloader,model,criterion,mode):
             outputs,_=model(inputs)
             outputs2=outputs-biaseddegree
 
-            score = F.softmax(outputs)
-            score2 = F.softmax(outputs2)
+            score = F.softmax(outputs, dim=1)
+            score2 = F.softmax(outputs2, dim=1)
 
             prediction=torch.argmax(score,dim=1)
             prediction2 = torch.argmax(score2, dim=1)
