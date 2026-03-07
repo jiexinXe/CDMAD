@@ -379,7 +379,6 @@ def main():
     model, params = create_model()
     ema_model,  _ = create_model(ema=True)
 
-    cudnn.benchmark = True
     print('    Total params: %.2fM' % (sum(p.numel() for p in params) / 1000000.0))
 
     train_criterion = SemiLoss()
