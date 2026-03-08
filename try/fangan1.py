@@ -64,37 +64,37 @@ parser.add_argument('--unlabeledratio', type=float, default=2, help='unlabeled b
 parser.add_argument('--debiasstart', type=int, default=100, help='epoch to start debias (warm start)')
 
 # -------------------------
-# Scheme-1: Probe distribution & bias estimator
+# Scheme-1 (Minimal): Anchor-augmented probe distribution + bias scale
 # -------------------------
-parser.add_argument('--debias-ramp', type=int, default=20,
-                    help='linear ramp epochs after debiasstart (0 -> no ramp, immediately full debias)')
-parser.add_argument('--probe-k', type=int, default=16,
-                    help='number of probe samples to estimate bias each update')
-parser.add_argument('--probe-update-freq', type=int, default=1,
-                    help='update bias every N iterations (only when debias weight > 0)')
-parser.add_argument('--probe-mode', type=str, default='eval', choices=['eval', 'train'],
-                    help='use model.eval() or model.train() when forwarding probe images (eval is recommended to avoid BN pollution)')
-parser.add_argument('--probe-ema', type=float, default=0.99,
-                    help='EMA decay for the estimated bias vector')
-parser.add_argument('--data-stat-ema', type=float, default=0.99,
-                    help='EMA decay for running data mean/std used by probe sampling')
+# Only TWO additional knobs are exposed for Scheme-1:
+#   --probe-anchor : fraction of probes that are CDMAD-like solid (constant) images (anchor)
+#   --bias-scale   : global scaling for the debias vector (shrinkage / strength control)
+parser.add_argument('--probe-anchor', type=float, default=0.15,
+                    help='Fraction of probes to use as a solid constant anchor image (CDMAD-like). Range [0,1].')
+parser.add_argument('--bias-scale', type=float, default=1.0,
+                    help='Global scaling for the estimated bias vector before subtraction (strength control).')
 
-# Probe mixture (distribution) in *input tensor space* (after transforms)
-parser.add_argument('--probe-mix-const', type=float, default=0.40,
-                    help='probability of constant probe = running data mean')
-parser.add_argument('--probe-mix-jitter', type=float, default=0.30,
-                    help='probability of jittered-mean probe (mean + gaussian)')
-# remaining probability goes to low-frequency probes
-parser.add_argument('--probe-jitter-scale', type=float, default=0.15,
-                    help='jitter scale relative to running data std')
-parser.add_argument('--probe-lowfreq-scale', type=float, default=0.25,
-                    help='lowfreq noise scale relative to running data std')
-parser.add_argument('--probe-lowfreq-size', type=int, default=4,
-                    help='base resolution for low-frequency noise (will be upsampled to image size)')
-parser.add_argument('--probe-clamp', type=float, default=4.0,
-                    help='clamp probe tensor values to [-probe-clamp, probe-clamp] to avoid extreme out-of-range probes')
 
 args = parser.parse_args()
+
+# -------------------------
+# Scheme-1 fixed implementation constants (kept internal to avoid too many hyper-parameters)
+# -------------------------
+PROBE_K = 16
+PROBE_UPDATE_FREQ = 20     # update bias every N iterations when debias is active (stabilized)
+PROBE_MODE = 'eval'        # 'eval' recommended to avoid BN pollution
+PROBE_EMA = 0.99           # EMA decay for bias vector
+PROBE_WARMUP_EPOCHS = 20    # warm up probe bias estimation before debiasstart (no extra args)
+DATA_STAT_EMA = 0.99       # EMA decay for running data mean/std
+# Mixture for the non-anchor portion (kept fixed)
+MIX_CONST = 0.40           # constant probe = running data mean
+MIX_JITTER = 0.30          # jittered mean (mean + gaussian)
+JITTER_SCALE = 0.15        # relative to running std
+LOWFREQ_SCALE = 0.25       # relative to running std
+LOWFREQ_SIZE = 4           # low-frequency base resolution
+PROBE_CLAMP = 4.0          # clamp probe tensor values to [-PROBE_CLAMP, PROBE_CLAMP]
+SOLID_VALUE = 1.0          # anchor image value in normalized input space (CDMAD-like "white" constant)
+
 state = {k: v for k, v in args._get_kwargs()}
 
 # Dataset import
@@ -132,14 +132,8 @@ torch.backends.cudnn.benchmark = False
 # Helpers: debias schedule
 # -------------------------
 def debias_weight(epoch: int) -> float:
-    """Linear ramp from 0 to 1 after debiasstart."""
-    if epoch <= args.debiasstart:
-        return 0.0
-    if args.debias_ramp <= 0:
-        return 1.0
-    # epoch = debiasstart+1 -> 1/ramp ; ... -> 1
-    w = (epoch - args.debiasstart) / float(args.debias_ramp)
-    return float(min(1.0, max(0.0, w)))
+    """Step function: full debias after debiasstart (no ramp)."""
+    return 1.0 if epoch > args.debiasstart else 0.0
 
 
 # -------------------------
@@ -166,6 +160,7 @@ class ProbeState:
         self.bias_ema = {}  # key -> tensor [num_class]
         self.last_metrics = {}  # key -> dict
 
+        self.bias_std_ref = {}  # key -> scalar tensor (reference std for scale-decoupling)
     @torch.no_grad()
     def update_data_stats(self, x: torch.Tensor):
         """Update running mean/std using EMA. x: [B,C,H,W] in model input space."""
@@ -180,7 +175,7 @@ class ProbeState:
             self.data_initialized = True
             return
 
-        m = float(args.data_stat_ema)
+        m = float(DATA_STAT_EMA)
         self.data_mean.mul_(m).add_(mu * (1.0 - m))
         self.data_std.mul_(m).add_(sd * (1.0 - m))
 
@@ -190,7 +185,7 @@ class ProbeState:
         Generate low-frequency noise by sampling at low resolution and upsampling.
         Returns: [K,C,H,W], per-sample standardized (zero-mean, unit-std).
         """
-        base = max(2, int(args.probe_lowfreq_size))
+        base = max(2, int(LOWFREQ_SIZE))
         noise = torch.randn(K, C, base, base, device=self.device)
         noise = F.interpolate(noise, size=(H, W), mode='bilinear', align_corners=False)
 
@@ -202,11 +197,15 @@ class ProbeState:
     @torch.no_grad()
     def sample_probes(self, K: int, H: int, W: int) -> torch.Tensor:
         """
-        Mixture distribution Q:
-          - const(mean)
-          - jitter(mean + gaussian)
-          - lowfreq(mean + upsampled lowfreq noise)
-        All in model input space.
+        Probe distribution Q (standalone Scheme-1, minimal knobs):
+
+        Q = anchor * Q_solid  + (1-anchor) * Q_mix
+
+        - Q_solid: CDMAD-like solid constant image (value = SOLID_VALUE in normalized input space)
+        - Q_mix  : fixed mixture in model input space:
+            * const(mean) with prob MIX_CONST
+            * jitter(mean + gaussian) with prob MIX_JITTER
+            * lowfreq(mean + upsampled lowfreq noise) with remaining prob
         """
         if not self.data_initialized:
             # fall back to zeros (usually corresponds to dataset mean after normalization)
@@ -217,33 +216,44 @@ class ProbeState:
         mu = self.data_mean  # [1,C,1,1]
         sd = self.data_std   # [1,C,1,1]
 
-        # mixture decisions
-        u = torch.rand(K, device=self.device)
-        p_const = float(args.probe_mix_const)
-        p_jitter = float(args.probe_mix_jitter)
-        # remaining -> lowfreq
+        anchor = float(args.probe_anchor)
+        anchor = max(0.0, min(1.0, anchor))
+        K_anchor = int(round(K * anchor))
+        K_anchor = max(0, min(K_anchor, K))
+        K_rest = K - K_anchor
 
         probes = torch.empty(K, C, H, W, device=self.device)
 
-        # 1) const
-        mask_const = (u < p_const)
-        if mask_const.any():
-            probes[mask_const] = mu.expand(mask_const.sum(), C, H, W)
+        # 0) solid anchor (CDMAD-like)
+        if K_anchor > 0:
+            probes[:K_anchor] = torch.full((K_anchor, C, H, W), float(SOLID_VALUE), device=self.device)
 
-        # 2) jitter
-        mask_jitter = (u >= p_const) & (u < p_const + p_jitter)
-        if mask_jitter.any():
-            eps = torch.randn(mask_jitter.sum(), C, H, W, device=self.device)
-            probes[mask_jitter] = mu.expand(mask_jitter.sum(), C, H, W) + eps * (sd * float(args.probe_jitter_scale))
+        # 1) mixture (non-anchor)
+        if K_rest > 0:
+            u = torch.rand(K_rest, device=self.device)
+            p_const = float(MIX_CONST)
+            p_jitter = float(MIX_JITTER)
 
-        # 3) lowfreq
-        mask_low = ~(mask_const | mask_jitter)
-        if mask_low.any():
-            lf = self._lowfreq_noise(mask_low.sum(), C, H, W)
-            probes[mask_low] = mu.expand(mask_low.sum(), C, H, W) + lf * (sd * float(args.probe_lowfreq_scale))
+            sub = probes[K_anchor:]  # view
+            # const(mean)
+            mask_const = (u < p_const)
+            if mask_const.any():
+                sub[mask_const] = mu.expand(mask_const.sum(), C, H, W)
+
+            # jitter(mean + gaussian)
+            mask_jitter = (u >= p_const) & (u < p_const + p_jitter)
+            if mask_jitter.any():
+                eps = torch.randn(mask_jitter.sum(), C, H, W, device=self.device)
+                sub[mask_jitter] = mu.expand(mask_jitter.sum(), C, H, W) + eps * (sd * float(JITTER_SCALE))
+
+            # lowfreq(mean + lowfreq noise)
+            mask_low = ~(mask_const | mask_jitter)
+            if mask_low.any():
+                lf = self._lowfreq_noise(mask_low.sum(), C, H, W)
+                sub[mask_low] = mu.expand(mask_low.sum(), C, H, W) + lf * (sd * float(LOWFREQ_SCALE))
 
         # clamp to avoid extreme activations
-        clamp_v = float(args.probe_clamp)
+        clamp_v = float(PROBE_CLAMP)
         if clamp_v > 0:
             probes = probes.clamp(min=-clamp_v, max=clamp_v)
         return probes
@@ -260,12 +270,12 @@ class ProbeState:
         if key not in self.bias_ema:
             self.bias_ema[key] = torch.zeros(self.num_class, device=self.device)
 
-        K = int(args.probe_k)
+        K = int(PROBE_K)
         probes = self.sample_probes(K, H, W)
 
         # prevent BN pollution by default
         prev_mode = model.training
-        if args.probe_mode == 'eval':
+        if PROBE_MODE == 'eval':
             model.eval()
         else:
             model.train()
@@ -279,10 +289,17 @@ class ProbeState:
         log_p = torch.log(p_bar)
         b_raw = log_p - log_p.mean()  # centering -> sum(b)=0
 
-        # EMA smoothing for b
-        ema = float(args.probe_ema)
-        self.bias_ema[key].mul_(ema).add_(b_raw * (1.0 - ema))
+        # --- scale-decoupled bias: keep std(b) stable over training ---
+        cur_std = b_raw.std(unbiased=False).clamp(min=1e-6)
+        if key not in self.bias_std_ref:
+            # set reference scale on first update for this key
+            self.bias_std_ref[key] = cur_std.detach().clone()
+        ref_std = self.bias_std_ref[key]
+        b_scaled = b_raw / cur_std * ref_std
 
+        # EMA smoothing for b (vector)
+        ema = float(PROBE_EMA)
+        self.bias_ema[key].mul_(ema).add_(b_scaled * (1.0 - ema))
         # metrics
         entropy = float((-p_bar * torch.log(p_bar)).sum().item())
         # per-probe centered log-prob variance (rough stability proxy)
@@ -291,7 +308,14 @@ class ProbeState:
         var = float(per.var(dim=0, unbiased=False).mean().item())
         norm = float(self.bias_ema[key].norm(p=2).item())
 
-        self.last_metrics[key] = {'entropy': entropy, 'var': var, 'norm': norm}
+        self.last_metrics[key] = {
+            'entropy': entropy,
+            'var': var,
+            'norm': norm,
+            'std_raw': float(cur_std.item()),
+            'std_ref': float(ref_std.item()),
+            'std_ema': float(self.bias_ema[key].std(unbiased=False).item()),
+        }
         return self.bias_ema[key].detach(), self.last_metrics[key]
 
 
@@ -301,11 +325,20 @@ class ProbeState:
 def main():
     global best_acc
 
+    # Best-checkpoint trackers (debiased metrics)
+    best_top1_debias = 0.0
+    best_top1_debias_epoch = 0
+    best_gm_debias = 0.0
+    best_gm_debias_epoch = 0
+
     if not os.path.isdir(args.out):
         mkdir_p(args.out)
 
     N_SAMPLES_PER_CLASS = make_imb_data(args.num_max, num_class, args.imb_ratio, args.imbalancetype)
     U_SAMPLES_PER_CLASS = make_imb_data(args.num_max_u, num_class, args.imb_ratio_u, args.imbalancetype)
+
+    # Head/Mid/Tail class splits (by labeled sample counts)
+    head_idx, mid_idx, tail_idx = split_head_mid_tail(N_SAMPLES_PER_CLASS)
 
     if np.array(N_SAMPLES_PER_CLASS).sum() + np.array(U_SAMPLES_PER_CLASS).sum() >= 30000 or args.dataset == 'stl10':
         args.wd = 0.01
@@ -382,19 +415,41 @@ def main():
             probe_state.bias_ema['train'] = checkpoint['probe_bias_ema_train'].to(device)
         if 'probe_bias_ema_ema' in checkpoint:
             probe_state.bias_ema['ema'] = checkpoint['probe_bias_ema_ema'].to(device)
+        if 'probe_bias_std_ref_train' in checkpoint and checkpoint['probe_bias_std_ref_train'] is not None:
+            probe_state.bias_std_ref['train'] = checkpoint['probe_bias_std_ref_train'].to(device)
+        if 'probe_bias_std_ref_ema' in checkpoint and checkpoint['probe_bias_std_ref_ema'] is not None:
+            probe_state.bias_std_ref['ema'] = checkpoint['probe_bias_std_ref_ema'].to(device)
+        # restore best metrics if present
+        if 'best_top1_debias' in checkpoint:
+            best_top1_debias = float(checkpoint['best_top1_debias'])
+            best_top1_debias_epoch = int(checkpoint.get('best_top1_debias_epoch', 0))
+        if 'best_gm_debias' in checkpoint:
+            best_gm_debias = float(checkpoint['best_gm_debias'])
+            best_gm_debias_epoch = int(checkpoint.get('best_gm_debias_epoch', 0))
         logger = Logger(os.path.join(args.out, 'log.txt'), title=title, resume=True)
     else:
         logger = Logger(os.path.join(args.out, 'log.txt'), title=title)
         # Keep the original 5-column logger interface to avoid breaking your parsing scripts.
         # Columns: bACC (no debias), GM (no debias), bACC (debias), GM (debias), Top1 (no debias)
-        logger.set_names(['bACC', 'GM', 'bACC_debias', 'GM_debias', 'Top1'])
+        logger.set_names(['bACC', 'GM', 'bACC_debias', 'GM_debias', 'Top1', 'Top1_debias'])
 
     for epoch in range(start_epoch, args.epochs):
         print('\nEpoch: [%d | %d] LR: %f | DebiasW: %.3f' %
               (epoch + 1, args.epochs, state['lr'], debias_weight(epoch)))
 
-        train(labeled_trainloader, unlabeled_trainloader, model, optimizer,
+        train_stats = train(labeled_trainloader, unlabeled_trainloader, model, optimizer,
               ema_optimizer, train_criterion, epoch, probe_state)
+
+        # Diagnostics CSV (appends one row per epoch)
+        diag_path = os.path.join(args.out, 'diag_scheme1.csv')
+        if (epoch == start_epoch) and (not os.path.exists(diag_path)):
+            with open(diag_path, 'w') as f:
+                f.write('epoch,dW,loss,loss_x,loss_u,mask_rate,max_p,probe_entropy,probe_var,bias_norm,bias_std_raw,bias_std_ref,bias_std_ema,corr_norm,corr_maxabs\n')
+        with open(diag_path, 'a') as f:
+            f.write(f"{epoch+1},{train_stats['dW']:.6f},{train_stats['loss']:.6f},{train_stats['loss_x']:.6f},{train_stats['loss_u']:.6f},"
+                    f"{train_stats['mask_rate']:.6f},{train_stats['max_p']:.6f},{train_stats['probe_entropy']:.6f},{train_stats['probe_var']:.6f},{train_stats['bias_norm']:.6f},"
+                    f"{train_stats['bias_std_raw']:.6f},{train_stats['bias_std_ref']:.6f},{train_stats['bias_std_ema']:.6f},"
+                    f"{train_stats['corr_norm']:.6f},{train_stats['corr_maxabs']:.6f}\n")
 
         test_acc1, testclassacc1, test_acc2, testclassacc2 = validate(
             test_loader, ema_model, criterion, mode='Test Stats ', epoch=epoch, probe_state=probe_state
@@ -403,22 +458,67 @@ def main():
         GM = geometric_mean(testclassacc1)
         GM2 = geometric_mean(testclassacc2)
 
-        print("without test debias bACC:", testclassacc1.mean(), "GM:", GM,
-              "with test debias bACC:", testclassacc2.mean(), "GM:", GM2)
+        # Head/Mid/Tail (by labeled counts) for raw & debiased
+        head_raw = float(np.mean(testclassacc1[head_idx]))
+        mid_raw = float(np.mean(testclassacc1[mid_idx]))
+        tail_raw = float(np.mean(testclassacc1[tail_idx]))
+        head_deb = float(np.mean(testclassacc2[head_idx]))
+        mid_deb = float(np.mean(testclassacc2[mid_idx]))
+        tail_deb = float(np.mean(testclassacc2[tail_idx]))
 
-        logger.append([testclassacc1.mean(), GM, testclassacc2.mean(), GM2, test_acc1])
-
-        save_checkpoint({
+        # Best checkpointing (based on debiased metrics)
+        state = {
             'epoch': epoch + 1,
             'state_dict': model.state_dict(),
             'ema_state_dict': ema_model.state_dict(),
             'optimizer': optimizer.state_dict(),
-            # probe states
             'probe_data_mean': probe_state.data_mean,
             'probe_data_std': probe_state.data_std,
             'probe_bias_ema_train': probe_state.bias_ema.get('train', None),
             'probe_bias_ema_ema': probe_state.bias_ema.get('ema', None),
-        }, epoch + 1)
+            'probe_bias_std_ref_train': probe_state.bias_std_ref.get('train', None),
+            'probe_bias_std_ref_ema': probe_state.bias_std_ref.get('ema', None),
+            'best_top1_debias': best_top1_debias,
+            'best_top1_debias_epoch': best_top1_debias_epoch,
+            'best_gm_debias': best_gm_debias,
+            'best_gm_debias_epoch': best_gm_debias_epoch,
+        }
+        if test_acc2 > best_top1_debias:
+            best_top1_debias = float(test_acc2)
+            best_top1_debias_epoch = int(epoch + 1)
+            state['best_top1_debias'] = best_top1_debias
+            state['best_top1_debias_epoch'] = best_top1_debias_epoch
+            save_best_checkpoint(state, args.out, 'best_top1_debias.pth.tar')
+        if GM2 > best_gm_debias:
+            best_gm_debias = float(GM2)
+            best_gm_debias_epoch = int(epoch + 1)
+            state['best_gm_debias'] = best_gm_debias
+            state['best_gm_debias_epoch'] = best_gm_debias_epoch
+            save_best_checkpoint(state, args.out, 'best_gm_debias.pth.tar')
+        # Full diagnostics CSV (train + test, one row per epoch)
+        full_path = os.path.join(args.out, 'diag_scheme1_full.csv')
+        if (epoch == start_epoch) and (not os.path.exists(full_path)):
+            with open(full_path, 'w') as f:
+                f.write('epoch,dW,loss,loss_x,loss_u,mask_rate,max_p,probe_entropy,probe_var,bias_norm,bias_std_raw,bias_std_ref,bias_std_ema,corr_norm,corr_maxabs,'
+                        'Top1,Top1_debias,bACC,GM,bACC_debias,GM_debias,head_raw,mid_raw,tail_raw,head_debias,mid_debias,tail_debias,'
+                        'best_top1_debias,best_top1_debias_epoch,best_gm_debias,best_gm_debias_epoch\n')
+        with open(full_path, 'a') as f:
+            f.write(
+                f"{epoch+1},{train_stats['dW']:.6f},{train_stats['loss']:.6f},{train_stats['loss_x']:.6f},{train_stats['loss_u']:.6f},"
+                f"{train_stats['mask_rate']:.6f},{train_stats['max_p']:.6f},{train_stats['probe_entropy']:.6f},{train_stats['probe_var']:.6f},{train_stats['bias_norm']:.6f},"
+                f"{train_stats['bias_std_raw']:.6f},{train_stats['bias_std_ref']:.6f},{train_stats['bias_std_ema']:.6f},{train_stats['corr_norm']:.6f},{train_stats['corr_maxabs']:.6f},"
+                f"{test_acc1:.6f},{test_acc2:.6f},{float(testclassacc1.mean()):.6f},{GM:.6f},{float(testclassacc2.mean()):.6f},{GM2:.6f},"
+                f"{head_raw:.6f},{mid_raw:.6f},{tail_raw:.6f},{head_deb:.6f},{mid_deb:.6f},{tail_deb:.6f},"
+                f"{best_top1_debias:.6f},{best_top1_debias_epoch},{best_gm_debias:.6f},{best_gm_debias_epoch}\n"
+            )
+
+        print("raw Test Top1:", test_acc1, " | debiased Test Top1:", test_acc2)
+        print("without test debias bACC:", testclassacc1.mean(), "GM:", GM,
+              "with test debias bACC:", testclassacc2.mean(), "GM:", GM2)
+
+        logger.append([testclassacc1.mean(), GM, testclassacc2.mean(), GM2, test_acc1, test_acc2])
+
+        save_checkpoint(state, epoch + 1)
 
     logger.close()
 
@@ -445,6 +545,15 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
     probe_entropy_m = AverageMeter()
     probe_var_m = AverageMeter()
     probe_norm_m = AverageMeter()
+    probe_std_raw_m = AverageMeter()
+    probe_std_ref_m = AverageMeter()
+    probe_std_ema_m = AverageMeter()
+    corr_norm_m = AverageMeter()
+    corr_maxabs_m = AverageMeter()
+
+    # pseudo-label diagnostics (epoch average)
+    mask_rate_m = AverageMeter()
+    max_p_m = AverageMeter()
 
     end = time.time()
     bar = Bar('Training', max=args.val_iteration)
@@ -486,17 +595,28 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
             outputs_u, _ = model(inputs_u)  # weak unlabeled logits
 
             # Scheme-1 debias: estimate bias using a *distribution* of probes
-            # Update bias every probe_update_freq iterations (only when debias is active)
-            if dW > 0 and (batch_idx % int(args.probe_update_freq) == 0):
-                b, m = probe_state.estimate_bias(model, H=H, W=W, key='train')
+            # Update bias every PROBE_UPDATE_FREQ iterations.
+            # Warm-start bias estimation PROBE_WARMUP_EPOCHS epochs before debiasstart, so turning debias on doesn't shock training.
+            bias_warm_epoch = max(0, int(args.debiasstart) - int(PROBE_WARMUP_EPOCHS))
+            do_probe_update = (epoch >= bias_warm_epoch) and (batch_idx % int(PROBE_UPDATE_FREQ) == 0)
+            if do_probe_update:
+                # use EMA teacher for more stable probe statistics
+                b, m = probe_state.estimate_bias(ema_optimizer.ema_model, H=H, W=W, key='train')
                 probe_entropy_m.update(m['entropy'], 1)
                 probe_var_m.update(m['var'], 1)
                 probe_norm_m.update(m['norm'], 1)
+                probe_std_raw_m.update(m.get('std_raw', 0.0), 1)
+                probe_std_ref_m.update(m.get('std_ref', 0.0), 1)
+                probe_std_ema_m.update(m.get('std_ema', 0.0), 1)
             else:
                 b = probe_state.bias_ema.get('train', torch.zeros(num_class, device=inputs_x.device))
 
+            b_eff = b * float(args.bias_scale)
             if dW > 0:
-                outputs_u = outputs_u - dW * b.view(1, -1).detach()
+                corr_vec = (dW * b_eff).detach()
+                corr_norm_m.update(float(corr_vec.norm(p=2).item()), 1)
+                corr_maxabs_m.update(float(corr_vec.abs().max().item()), 1)
+            outputs_u = outputs_u - dW * b_eff.view(1, -1).detach()
 
             targets_u2 = F.softmax(outputs_u, dim=1).detach()
 
@@ -505,12 +625,17 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
         select_mask = max_p.ge(args.tau)
         select_mask = torch.cat([select_mask, select_mask], 0).float()
 
+        # diagnostics for pseudo-labeling
+        mask_rate_m.update(float(max_p.ge(args.tau).float().mean().item()), 1)
+        max_p_m.update(float(max_p.mean().item()), 1)
+
         # Use soft targets (your original code uses targets_u2 rather than p_hat)
         all_targets = torch.cat([targets_x2, targets_u2, targets_u2], dim=0)
 
         logits_x, _ = model(inputs_x)
         logits_u2, _ = model(inputs_u2)
         logits_u3, _ = model(inputs_u3)
+
         logits_u = torch.cat([logits_u2, logits_u3], dim=0)
 
         Lx, Lu = criterion(logits_x, all_targets[:batch_size], logits_u, all_targets[batch_size:], select_mask)
@@ -534,12 +659,27 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
             loss=losses.avg, loss_x=losses_x.avg, loss_u=losses_u.avg
         )
         if dW > 0 and probe_entropy_m.count > 0:
-            suffix += ' | ProbeH: %.3f Var: %.4f ||b||: %.3f' % (probe_entropy_m.avg, probe_var_m.avg, probe_norm_m.avg)
+            suffix += ' | ProbeH: %.3f Var: %.4f ||b||: %.3f | Corr||: %.3f CorrMax: %.3f' % (probe_entropy_m.avg, probe_var_m.avg, probe_norm_m.avg, corr_norm_m.avg, corr_maxabs_m.avg)
         bar.suffix = suffix
         bar.next()
 
     bar.finish()
-    return (losses.avg, losses_x.avg, losses_u.avg)
+    return {
+        'loss': float(losses.avg),
+        'loss_x': float(losses_x.avg),
+        'loss_u': float(losses_u.avg),
+        'dW': float(dW),
+        'mask_rate': float(mask_rate_m.avg) if mask_rate_m.count > 0 else 0.0,
+        'max_p': float(max_p_m.avg) if max_p_m.count > 0 else 0.0,
+        'probe_entropy': float(probe_entropy_m.avg) if probe_entropy_m.count > 0 else 0.0,
+        'probe_var': float(probe_var_m.avg) if probe_var_m.count > 0 else 0.0,
+        'bias_norm': float(probe_norm_m.avg) if probe_norm_m.count > 0 else 0.0,
+        'bias_std_raw': float(probe_std_raw_m.avg) if probe_std_raw_m.count > 0 else 0.0,
+        'bias_std_ref': float(probe_std_ref_m.avg) if probe_std_ref_m.count > 0 else 0.0,
+        'bias_std_ema': float(probe_std_ema_m.avg) if probe_std_ema_m.count > 0 else 0.0,
+        'corr_norm': float(corr_norm_m.avg) if corr_norm_m.count > 0 else 0.0,
+        'corr_maxabs': float(corr_maxabs_m.avg) if corr_maxabs_m.count > 0 else 0.0,
+    }
 
 
 def validate(valloader, model, criterion, mode, epoch: int, probe_state: ProbeState):
@@ -574,7 +714,8 @@ def validate(valloader, model, criterion, mode, epoch: int, probe_state: ProbeSt
             inputs, targets = inputs.cuda(), targets.cuda(non_blocking=True)
 
             outputs, _ = model(inputs)
-            outputs2 = outputs - b_ema.view(1, -1)
+            b_eff = b_ema * float(args.bias_scale)
+            outputs2 = outputs - b_eff.view(1, -1)
 
             score = F.softmax(outputs, dim=1)
             score2 = F.softmax(outputs2, dim=1)
@@ -619,6 +760,22 @@ def validate(valloader, model, criterion, mode, epoch: int, probe_state: ProbeSt
     return (top1.avg, accperclass, top1debias.avg, accperclass2)
 
 
+
+
+def split_head_mid_tail(n_samples_per_class):
+    """Return (head_idx, mid_idx, tail_idx) by labeled sample counts (descending)."""
+    arr = np.asarray(n_samples_per_class, dtype=np.int64)
+    order = np.argsort(-arr)  # desc
+    c = len(arr)
+    # 3-way split (rough thirds). For CIFAR10: 3/4/3; for CIFAR100: 33/34/33.
+    head_n = c // 3
+    tail_n = c // 3
+    mid_n = c - head_n - tail_n
+    head_idx = order[:head_n]
+    mid_idx = order[head_n:head_n + mid_n]
+    tail_idx = order[head_n + mid_n:]
+    return head_idx, mid_idx, tail_idx
+
 def make_imb_data(max_num, class_num, gamma, imb):
     if imb == 'long':
         mu = np.power(1 / gamma, 1 / (class_num - 1))
@@ -647,6 +804,13 @@ def save_checkpoint(state, epoch, checkpoint=args.out, filename='checkpoint.pth.
     torch.save(state, filepath)
     if epoch % 100 == 0:
         shutil.copyfile(filepath, os.path.join(checkpoint, 'model_' + str(epoch) + '.pth.tar'))
+
+
+def save_best_checkpoint(state, checkpoint, filename):
+    """Save a best checkpoint (no periodic copies)."""
+    filepath = os.path.join(checkpoint, filename)
+    torch.save(state, filepath)
+
 
 
 class SemiLoss(object):

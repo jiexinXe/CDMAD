@@ -85,6 +85,9 @@ parser.add_argument('--am-lr', type=float, default=0.08, help='probe optimizer l
 parser.add_argument('--am-clamp', type=float, default=4.0, help='clamp probe tensor values to [-am-clamp, am-clamp]')
 parser.add_argument('--am-stat-weight', type=float, default=1.0, help='weight of activation-stat matching loss')
 parser.add_argument('--am-ent-weight', type=float, default=0.2, help='weight of entropy (semantic-suppressed) loss')
+parser.add_argument('--am-tv', type=float, default=1e-3, help='weight of total-variation smoothness on probe grid (semantic suppression)')
+parser.add_argument('--am-l2', type=float, default=1e-4, help='weight of L2 penalty on probe grid (keeps probes near mean)')
+parser.add_argument('--am-cons-weight', type=float, default=1.0, help='weight of probe consensus loss (encourage probes to share same output distribution)')
 parser.add_argument('--am-mode', type=str, default='eval', choices=['eval', 'train'],
                     help='forward probes under model.eval() (recommended) or model.train()')
 parser.add_argument('--am-warmup-iters', type=int, default=200, help='warmup iters before using probes for debias')
@@ -157,6 +160,7 @@ class ActivationMatchedProbes:
         self.probes = None   # nn.Parameter [M,3,H,W]
         self.opt = None      # Adam optimizer for probes
         self.HW = None
+        self.grid_hw = None  # low-res probe grid size
         self.global_iter = 0
 
     def _make_hook(self, idx):
@@ -168,26 +172,54 @@ class ActivationMatchedProbes:
         return _hook
 
     def _ensure_shape(self, H: int, W: int):
-        if self.probes is not None and self.HW == (H, W):
+        """Ensure probes are initialized.
+
+        v2 change (MaxEnt Moment-Matched Baseline):
+          - Probes are parameterized as a *low-resolution grid* and upsampled to (H,W) via bilinear interpolation.
+          - This *reduces degrees of freedom* (harder to leak semantics), avoids “industrial” heavy tuning,
+            and makes the baseline-picture definition closer to a *moment-constrained maximum-entropy* object.
+        """
+        # deterministic rule (no extra hyper-parameter sweeps):
+        # CIFAR (32x32): 8x8 grid; STL (96x96): 16x16 grid; larger: 32x32.
+        mn = min(int(H), int(W))
+        g = 8 if mn <= 32 else (16 if mn <= 96 else 32)
+        gh, gw = min(g, int(H)), min(g, int(W))
+
+        if self.probes is not None and self.HW == (H, W) and self.grid_hw == (gh, gw):
             return
+
         M = max(1, int(args.am_num_probes))
-        # init near 0 (often corresponds to dataset mean in normalized space)
-        init = torch.zeros((M, 3, H, W), device=self.device)
-        # small noise to break symmetry
+        init = torch.zeros((M, 3, gh, gw), device=self.device)
         init += 0.05 * torch.randn_like(init)
         self.probes = nn.Parameter(init)
         self.opt = optim.Adam([self.probes], lr=float(args.am_lr))
         self.HW = (H, W)
+        self.grid_hw = (gh, gw)
 
     @staticmethod
     def _entropy_loss_from_logits(logits: torch.Tensor) -> torch.Tensor:
-        """
-        Minimize sum p log p -> maximize entropy.
-        logits: [B,C]
-        returns scalar
+        """Negative entropy (to minimize).
+
+        We minimize  Σ_c p_c log p_c  which is equivalent to maximizing entropy H(p).
+        This is the “MaxEnt” part of Scheme-4.
         """
         p = F.softmax(logits, dim=1).clamp(min=1e-8)
         return torch.mean(torch.sum(p * torch.log(p), dim=1))
+
+    @staticmethod
+    def _entropy_from_logits(logits: torch.Tensor) -> float:
+        """Return mean entropy H(p) for logging."""
+        p = F.softmax(logits, dim=1).clamp(min=1e-8)
+        H = -torch.sum(p * torch.log(p), dim=1)
+        return float(H.mean().detach().cpu().item())
+
+    def _render(self, H: int, W: int) -> torch.Tensor:
+        """Upsample low-res probe grid to model input resolution."""
+        assert self.probes is not None
+        x = self.probes
+        if x.shape[-2:] != (int(H), int(W)):
+            x = F.interpolate(x, size=(int(H), int(W)), mode='bilinear', align_corners=False)
+        return x
 
     def _stat_loss(self, model: nn.Module) -> torch.Tensor:
         """
@@ -215,7 +247,7 @@ class ActivationMatchedProbes:
             loss = loss + F.mse_loss(mu, target_mu) + F.mse_loss(var, target_var)
         return loss
 
-    def maybe_update(self, model: nn.Module, H: int, W: int, steps: int = None):
+    def maybe_update(self, model: nn.Module, H: int, W: int, steps: int = None, force: bool = False):
         """
         Update probes every am_update_freq iterations.
         Called during training; uses model in eval (default) to avoid BN pollution.
@@ -227,7 +259,7 @@ class ActivationMatchedProbes:
             steps = int(args.am_steps)
 
         # Only update at scheduled frequency
-        if int(args.am_update_freq) > 1 and (self.global_iter % int(args.am_update_freq) != 0):
+        if (not force) and int(args.am_update_freq) > 1 and (self.global_iter % int(args.am_update_freq) != 0):
             return
 
         # Run a few optimization steps
@@ -243,14 +275,34 @@ class ActivationMatchedProbes:
             self._capture_on = True
 
             # Forward probes (need grad)
-            logits, _ = model(self.probes)
+            logits, _ = model(self._render(H, W))
 
             # capture done
             self._capture_on = False
 
             stat_loss = self._stat_loss(model) * float(args.am_stat_weight)
-            ent_loss = self._entropy_loss_from_logits(logits) * float(args.am_ent_weight)
-            loss = stat_loss + ent_loss
+
+            # -----------------------------
+            # v5 fix: do NOT maximize entropy.
+            # High-entropy probes make the bias signal vanish (bias≈0 => debias has no effect).
+            # Instead, suppress semantics via:
+            #   (1) low-res grid parameterization (already),
+            #   (2) smoothness (TV) + small L2,
+            #   (3) probe-consensus: force probes to agree on the same output distribution,
+            #       so we measure model bias rather than probe-specific semantics.
+            # -----------------------------
+            p = F.softmax(logits, dim=1).clamp(min=1e-8)        # [M,K]
+            p_mean = p.mean(dim=0, keepdim=True)               # [1,K]
+            cons_loss = ((p - p_mean) ** 2).mean() * float(args.am_cons_weight)
+
+            # Smoothness on low-res grid (semantic suppression)
+            xg = self.probes  # [M,3,gh,gw]
+            tv = (xg[:, :, :, 1:] - xg[:, :, :, :-1]).abs().mean() + (xg[:, :, 1:, :] - xg[:, :, :-1, :]).abs().mean()
+            tv_loss = tv * float(args.am_tv)
+
+            l2_loss = (xg ** 2).mean() * float(args.am_l2)
+
+            loss = stat_loss + cons_loss + tv_loss + l2_loss
 
             loss.backward()
             self.opt.step()
@@ -267,14 +319,38 @@ class ActivationMatchedProbes:
     @torch.no_grad()
     def bias_logits(self, model: nn.Module, H: int, W: int) -> torch.Tensor:
         """
-        Compute bias logits as mean logits over probes.
+        Estimate class-bias bθ from no-information probes.
+
+        Follow BiAL definition:
+            b_tilde_c = log( E_I [ p_theta(y=c | I) ] ),
+            b = b_tilde - mean(b_tilde).
+
+        Using log-mean-prob (instead of mean-logits) makes the estimator:
+          - probability-calibrated,
+          - shift-invariant (after centering),
+          - directly compatible with logit/energy subtraction.
         """
         self._ensure_shape(H, W)
         prev_train = model.training
         model.eval()  # recommended for stability
-        logits, _ = model(self.probes.detach())
+        logits, _ = model(self._render(H, W).detach())     # [M,K]
         model.train(prev_train)
-        return logits.mean(dim=0).detach()
+
+        p = F.softmax(logits, dim=1).mean(dim=0).clamp(min=1e-12)  # [K]
+        b = torch.log(p)
+        b = b - b.mean()
+        return b.detach()
+
+
+    @torch.no_grad()
+    def probe_entropy(self, model: nn.Module, H: int, W: int) -> float:
+        """Entropy of probe predictions (higher => less semantic / more uniform)."""
+        self._ensure_shape(H, W)
+        prev_train = model.training
+        model.eval()
+        logits, _ = model(self._render(H, W).detach())
+        model.train(prev_train)
+        return self._entropy_from_logits(logits)
 
     def close(self):
         for h in self._hooks:
@@ -354,7 +430,8 @@ def main():
     else:
         logger = Logger(os.path.join(args.out, 'log.txt'), title=title)
         # stable 5 columns for your parsing scripts
-        logger.set_names(['bACC', 'GM', 'bACC_debias', 'GM_debias', 'Top1'])
+        # NOTE: for fair comparison with CDMAD-style reporting, we log Top1_debias here.
+        logger.set_names(['bACC', 'GM', 'bACC_debias', 'GM_debias', 'Top1_debias'])
 
     # Determine H,W once (supports STL sizes)
     with torch.no_grad():
@@ -380,8 +457,9 @@ def main():
 
         print("without test debias bACC:", testclassacc1.mean(), "GM:", GM,
               "with test debias bACC:", testclassacc2.mean(), "GM:", GM2)
+        print("Top1 (no debias):", test_acc1, "| Top1_debias:", test_acc2)
 
-        logger.append([testclassacc1.mean(), GM, testclassacc2.mean(), GM2, test_acc1])
+        logger.append([testclassacc1.mean(), GM, testclassacc2.mean(), GM2, test_acc2])
 
         save_checkpoint({
             'epoch': epoch + 1,
@@ -457,17 +535,25 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
         probe_ready_m.update(ready, 1)
 
         with torch.no_grad():
-            outputs_u, _ = model(inputs_u)
-            if epoch > args.debiasstart and ready > 0.5:
-                biaseddegree = am_probes.bias_logits(model, H, W)
+            # Raw weak predictions (used ONLY for confidence mask, to keep training strength comparable to CDMAD/FixMatch)
+            outputs_u_raw, _ = model(inputs_u)
+
+            # Debiased weak predictions (used for pseudo-label targets / class preference)
+            outputs_u_debias = outputs_u_raw
+            if epoch >= args.debiasstart and ready > 0.5:
+                biaseddegree = am_probes.bias_logits(model, H, W)  # already centered
                 bias_norm_m.update(biaseddegree.norm(p=2).item(), 1)
-                outputs_u = outputs_u - biaseddegree.detach()
+                outputs_u_debias = outputs_u_raw - biaseddegree.view(1, -1)
 
-            targets_u2 = F.softmax(outputs_u, dim=1).detach()
+            targets_u2 = F.softmax(outputs_u_debias, dim=1).detach()
 
-        max_p, p_hat = torch.max(targets_u2, dim=1)
+            # Confidence mask from RAW probabilities (decoupled from debias so τ does not change effective unlabeled rate)
+            probs_raw = F.softmax(outputs_u_raw, dim=1).detach()
+            max_p, p_hat = torch.max(targets_u2, dim=1)  # class from debiased targets
+            max_p_raw, _ = torch.max(probs_raw, dim=1)
+
         p_hat = torch.zeros(int(args.unlabeledratio * batch_size), num_class).cuda().scatter_(1, p_hat.view(-1, 1), 1)
-        select_mask = max_p.ge(args.tau)
+        select_mask = max_p_raw.ge(args.tau)
         select_mask = torch.cat([select_mask, select_mask], 0).float()
 
         all_targets = torch.cat([targets_x2, targets_u2, targets_u2], dim=0)
@@ -493,11 +579,11 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
         end = time.time()
 
         bar.suffix = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | ETA: {eta:} | ' \
-                     'Loss: {loss:.4f} | Lx: {loss_x:.4f} | Lu: {loss_u:.4f} | ProbeReady: {pr:.2f}'.format(
+                     'Loss: {loss:.4f} | Lx: {loss_x:.4f} | Lu: {loss_u:.4f} | ProbeReady: {pr:.2f} | Sel: {sel:.2f}'.format(
                         batch=batch_idx + 1, size=args.val_iteration,
                         data=data_time.avg, bt=batch_time.avg, eta=bar.eta_td,
                         loss=losses.avg, loss_x=losses_x.avg, loss_u=losses_u.avg,
-                        pr=probe_ready_m.avg
+                        pr=probe_ready_m.avg, sel=float(select_mask.mean().item())
                      )
         if epoch > args.debiasstart and bias_norm_m.count > 0:
             bar.suffix += ' | ||b||: %.3f' % bias_norm_m.avg
@@ -531,10 +617,12 @@ def validate(valloader, model, criterion, mode: str, epoch: int, am_probes_ema: 
     # Adapt EMA probes a little (optional) so they match EMA BN running stats
     if int(args.am_test_adapt_steps) > 0:
         with torch.enable_grad():
-            am_probes_ema.maybe_update(model, H, W, steps=int(args.am_test_adapt_steps))
+            # force=True so test-time adaptation really runs (not blocked by am_update_freq)
+            am_probes_ema.maybe_update(model, H, W, steps=int(args.am_test_adapt_steps), force=True)
 
     with torch.no_grad():
         biaseddegree = am_probes_ema.bias_logits(model, H, W)
+        probe_H = am_probes_ema.probe_entropy(model, H, W)
 
         for batch_idx, (inputs, targets, _) in enumerate(valloader):
             data_time.update(time.time() - end)
@@ -583,6 +671,8 @@ def validate(valloader, model, criterion, mode: str, epoch: int, am_probes_ema: 
     elif args.dataset == 'cifar100':
         accperclass = accperclass / 100
         accperclass2 = accperclass2 / 100
+
+    print(f"[Probe entropy] H(p)={probe_H:.4f} (higher=>less semantic)")
 
     return (top1.avg, accperclass, top1debias.avg, accperclass2)
 
