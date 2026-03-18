@@ -36,12 +36,19 @@ DIAG_FIELDS = [
     "pl_head_mass_raw","pl_tail_mass_raw","pl_head_tail_ratio_raw",
     "pl_head_mass_debias","pl_tail_mass_debias","pl_head_tail_ratio_debias",
     "bn_drift_l2","corr_logpb_logpi_labeled","corr_logpb_logpi_pl_raw",
-    "zra_energy"] # [修改] 用于监控 ZRA-Base 特征能量趋近于 0 的程度
+    "zra_energy", # [修改] 用于监控 ZRA-Base 特征能量趋近于 0 的程度
+    # ---- alpha diagnostics ----
+    "alpha_mean","alpha_p10","alpha_p50","alpha_p90",
+    "alpha_raw_head_mean","alpha_raw_tail_mean",
+    "alpha_flip_mean","alpha_headflip_mean","alpha_tailflip_mean",
+    "ind_loss","ind_align_before","ind_align_after"
+    ]
 
 DIAG_F = None
 DIAG_WRITER = None
 PROBE_EMA = None  # torch tensor [C]
 EMA_MEAN_IMG = None  # torch tensor [1, C, H, W]
+IND_EMA_MEAN = None  # torch tensor [1, C] for IC-ZRA batch-mean smoothing
 
 # === ZRA-Base 全局变量 ===
 X_BASE = None           # 可学习的零响应基准图 Parameter
@@ -144,6 +151,81 @@ def get_bias_logits(model: nn.Module, x_ref: torch.Tensor, baseline_mode: str) -
         return 0.5 * (l_pos + l_neg)
     x_probe = get_single_baseline_probe(x_ref, baseline_mode)
     return forward_probe_logits(model, x_probe, "eval")
+
+def _center_logits(logits: torch.Tensor) -> torch.Tensor:
+    return logits - logits.mean(dim=-1, keepdim=True)
+
+
+def apply_debias_logits(logits: torch.Tensor,
+                        b_logits: torch.Tensor,
+                        scheme: str = "adaptive_scale",
+                        eps: float = 1e-12,
+                        return_alpha: bool = False) -> torch.Tensor:
+    """
+    Debias logits using either:
+      - fixed subtraction: z - b
+      - Adaptive-Scale ZRA (AS-ZRA): z - alpha(z) * b
+        where alpha(z) = <center(z), center(b)> / ||center(b)||^2
+
+    logits: [B, C] or [C]
+    b_logits: [C] or [1, C]
+
+    return_alpha:
+      if True, return (out, alpha) where alpha is [B,1] (or scalar if input was [C])
+    """
+    scheme = scheme.lower()
+
+    squeeze_back = False
+    if logits.dim() == 1:
+        logits = logits.unsqueeze(0)
+        squeeze_back = True
+
+    if b_logits.dim() == 1:
+        b = b_logits.view(1, -1)
+    else:
+        b = b_logits.view(1, -1)
+
+    if scheme == 'fixed':
+        alpha = torch.ones((logits.size(0), 1), device=logits.device, dtype=logits.dtype)
+        out = logits - b
+
+    elif scheme in ('adaptive_scale', 'aszra', 'adaptive-scale'):
+        zc = _center_logits(logits)
+        bc = _center_logits(b)
+        denom = (bc * bc).sum(dim=1, keepdim=True).clamp_min(eps)
+
+        # 1) 先计算原始 alpha
+        alpha_raw = (zc * bc).sum(dim=1, keepdim=True) / denom
+
+        # 2) rank-normalized alpha:
+        #    用当前 batch 的 10% / 90% 分位数做归一化，
+        #    减少不同阶段/不同 batch 的尺度漂移
+        if alpha_raw.size(0) > 1:
+            q = torch.quantile(
+                alpha_raw.detach().view(-1),
+                torch.tensor([0.1, 0.9], device=alpha_raw.device, dtype=alpha_raw.dtype)
+            )
+            q10, q90 = q[0], q[1]
+            alpha = (alpha_raw - q10) / (q90 - q10 + eps)
+        else:
+            # batch=1 时退化为原始 alpha
+            alpha = alpha_raw
+
+        # 3) bounded / nonnegative
+        alpha = alpha.clamp(min=0.0, max=1.0)
+
+        out = logits - alpha * b
+        
+    else:
+        raise ValueError(f'Unknown debias scheme: {scheme}')
+
+    if squeeze_back:
+        out = out.squeeze(0)
+        alpha = alpha.squeeze(0)
+
+    if return_alpha:
+        return out, alpha
+    return out
 
 def make_probe_like(x_ref: torch.Tensor, kind: str) -> torch.Tensor:
     kind = kind.lower()
@@ -260,6 +342,68 @@ def _mass_ratio_from_counts(counts: torch.Tensor, head_mask: torch.Tensor, tail_
     ratio = (head + 1e-12) / (tail + 1e-12)
     return float(head.item()), float(tail.item()), float(ratio.item())
 
+def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> float:
+    """
+    x: [B] float tensor
+    mask: [B] bool tensor
+    return NaN if mask is empty
+    """
+    if mask.numel() == 0 or (not bool(mask.any().item())):
+        return float('nan')
+    return float(x[mask].mean().item())
+
+
+
+def _ind_start_epoch() -> int:
+    return args.ind_start if args.ind_start >= 0 else (args.debiasstart + 50)
+
+def independence_loss_from_logits(logits_deb: torch.Tensor,
+                                  b_logits: torch.Tensor,
+                                  eps: float = 1e-12,
+                                  margin: float = 0.05,
+                                  ema_decay: float = 0.9):
+    """
+    Stabilized IC-ZRA batch-level independence regularization.
+
+    Compared with the original squared projection penalty, this version:
+      1) uses an EMA-smoothed batch mean to reduce mini-batch noise,
+      2) uses a marginized cosine penalty to avoid forcing exact orthogonality,
+      3) penalizes only excessive absolute alignment, reducing collapse / over-flattening.
+
+    Returns:
+      loss_ind: scalar tensor
+      align_after: signed cosine alignment after fixed debias (EMA-smoothed forward value)
+    """
+    global IND_EMA_MEAN
+
+    if logits_deb.dim() == 1:
+        logits_deb = logits_deb.unsqueeze(0)
+    if b_logits.dim() == 1:
+        b = b_logits.view(1, -1)
+    else:
+        b = b_logits.view(1, -1)
+
+    mean_deb_c = _center_logits(logits_deb).mean(dim=0, keepdim=True)
+
+    mean_det = mean_deb_c.detach()
+    if IND_EMA_MEAN is None or IND_EMA_MEAN.shape != mean_det.shape:
+        IND_EMA_MEAN = mean_det.clone()
+    else:
+        IND_EMA_MEAN.mul_(ema_decay).add_(mean_det * (1.0 - ema_decay))
+
+    # Forward uses EMA-smoothed statistic, gradient still flows through current mean_deb_c
+    mean_used = mean_deb_c + (IND_EMA_MEAN.detach() - mean_deb_c.detach())
+
+    bc = _center_logits(b)
+    num = (mean_used * bc).sum(dim=1, keepdim=True)
+    denom_mean = (mean_used * mean_used).sum(dim=1, keepdim=True).clamp_min(eps).sqrt()
+    denom_b = (bc * bc).sum(dim=1, keepdim=True).clamp_min(eps).sqrt()
+    cos_align = num / (denom_mean * denom_b + eps)
+
+    # Soft margin: only penalize excessive alignment magnitude.
+    loss_ind = F.relu(cos_align.abs() - margin).pow(2).mean()
+    align_after = float(cos_align.item())
+    return loss_ind, align_after
 parser = argparse.ArgumentParser(description='PyTorch fixMatch Training')
 # Optimization options
 parser.add_argument('--epochs', default=500, type=int, metavar='N', help='number of total epochs to run')
@@ -305,6 +449,13 @@ parser.add_argument('--log-bn-drift', action='store_true', help='Log BN running-
 parser.add_argument('--fma-lr', type=float, default=0.01, help='Learning rate for ZRA-Base inner-loop optimization.')
 parser.add_argument('--fma-tv-weight', type=float, default=0.0001, help='TV loss weight to keep ZRA-Base smooth.')
 parser.add_argument('--mean-ema-decay', type=float, default=0.999, help='EMA decay for feature mean.')
+parser.add_argument('--debias-scheme', type=str, default='fixed', choices=['fixed', 'adaptive_scale'], help='Debias rule: fixed subtraction or AS-ZRA adaptive-scale subtraction.')
+parser.add_argument('--ind-weight', type=float, default=0.005, help='Weight for stabilized batch-level independence regularization on weak-view debiased logits.')
+parser.add_argument('--ind-eps', type=float, default=1e-12, help='Numerical epsilon for independence regularization.')
+parser.add_argument('--ind-margin', type=float, default=0.05, help='Soft margin for IC-ZRA cosine alignment penalty.')
+parser.add_argument('--ind-ema-decay', type=float, default=0.9, help='EMA decay for batch-mean residual used in IC-ZRA.')
+parser.add_argument('--ind-start', type=int, default=-1, help='Epoch to start IC-ZRA. If < 0, use debiasstart + 50.')
+parser.add_argument('--aszra-eps', type=float, default=1e-12, help='Numerical epsilon for AS-ZRA alpha estimation.')
 
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
@@ -334,7 +485,8 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
 def main():
-    global best_acc
+    global best_acc, IND_EMA_MEAN
+    IND_EMA_MEAN = None
 
     if not os.path.isdir(args.out):
         mkdir_p(args.out)
@@ -407,7 +559,7 @@ def main():
         logger = Logger(os.path.join(args.out, 'log.txt'), title=title, resume=True)
     else:
         logger = Logger(os.path.join(args.out, 'log.txt'), title=title)
-        logger.set_names(['TrainLoss','LossX','LossU','AcceptDebias','bL2','bEntropy','bACC_raw','GM_raw','bACC_debias','GM_debias','top1_raw','top1_debias'])
+        logger.set_names(['TrainLoss','LossX','LossU','LossInd','AcceptDebias','bL2','bEntropy','bACC_raw','GM_raw','bACC_debias','GM_debias','top1_raw','top1_debias'])
         
     for epoch in range(start_epoch, args.epochs):
         print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
@@ -430,7 +582,7 @@ def main():
 
         print("raw: top1:", test_acc1, "bACC:", testclassacc1.mean(), "GM:", GM, "| debias: top1:", test_acc2, "bACC:", testclassacc2.mean(), "GM:", GM2)
         logger.append([
-            train_stats['loss'], train_stats['loss_x'], train_stats['loss_u'],
+            train_stats['loss'], train_stats['loss_x'], train_stats['loss_u'], train_stats['loss_ind'],
             train_stats['accept_debias'], train_stats['b_l2'], train_stats['b_entropy'],
             testclassacc1.mean(), GM, testclassacc2.mean(), GM2, test_acc1, test_acc2
         ])
@@ -451,6 +603,7 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
     losses = AverageMeter()
     losses_x = AverageMeter()
     losses_u = AverageMeter()
+    losses_ind = AverageMeter()
     accept_deb_meter = AverageMeter()
     b_l2_meter = AverageMeter()
     b_entropy_meter = AverageMeter()
@@ -560,11 +713,47 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
 
         with torch.no_grad():
             outputs_u_debias = outputs_u_raw
+            alpha_u = None
+
             if epoch > args.debiasstart:
-                outputs_u_debias = outputs_u_raw - b_logits.view(1, -1)
+                outputs_u_debias, alpha_u = apply_debias_logits(
+                    outputs_u_raw,
+                    b_logits,
+                    scheme=args.debias_scheme,
+                    eps=args.aszra_eps,
+                    return_alpha=True
+                )
 
             targets_u_raw = F.softmax(outputs_u_raw, dim=1).detach()
             targets_u2 = F.softmax(outputs_u_debias, dim=1).detach()
+
+        loss_ind = torch.tensor(0.0, device=inputs_x.device)
+        ind_align_before = float('nan')
+        ind_align_after = float('nan')
+
+        ind_start_epoch = _ind_start_epoch()
+        if (epoch >= ind_start_epoch) and (args.ind_weight > 0.0):
+            # IC-ZRA: keep fixed global debias, then softly suppress only excessive
+            # batch-level residual alignment with the global bias direction.
+            outputs_u_ind, _ = model(inputs_u)
+            outputs_u_ind_deb = outputs_u_ind - b_logits.detach().view(1, -1)
+
+            # logging before normalized alignment with bias direction (current batch statistic)
+            mean_raw_c = _center_logits(outputs_u_ind).mean(dim=0, keepdim=True)
+            mean_deb_c = _center_logits(outputs_u_ind_deb).mean(dim=0, keepdim=True)
+            bc = _center_logits(b_logits.detach().view(1, -1))
+            num_before = (mean_raw_c * bc).sum(dim=1, keepdim=True)
+            denom_before = ((mean_raw_c * mean_raw_c).sum(dim=1, keepdim=True).clamp_min(args.ind_eps).sqrt() *
+                            (bc * bc).sum(dim=1, keepdim=True).clamp_min(args.ind_eps).sqrt() + args.ind_eps)
+            ind_align_before = float((num_before / denom_before).item())
+
+            loss_ind, ind_align_after = independence_loss_from_logits(
+                outputs_u_ind_deb,
+                b_logits.detach(),
+                eps=args.ind_eps,
+                margin=args.ind_margin,
+                ema_decay=args.ind_ema_decay
+            )
 
         max_p, p_hat = torch.max(targets_u2, dim=1)
         p_hat = torch.zeros(int(args.unlabeledratio*batch_size), num_class).cuda().scatter_(1, p_hat.view(-1, 1), 1)
@@ -618,6 +807,48 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
             log_pi_pl = torch.log(pl_pi).cpu()
             corr_logpb_pl = pearson_corr(logpb, log_pi_pl)
 
+                        # -------- alpha diagnostics --------
+            alpha_mean = float('nan')
+            alpha_p10 = float('nan')
+            alpha_p50 = float('nan')
+            alpha_p90 = float('nan')
+            alpha_raw_head_mean = float('nan')
+            alpha_raw_tail_mean = float('nan')
+            alpha_flip_mean = float('nan')
+            alpha_headflip_mean = float('nan')
+            alpha_tailflip_mean = float('nan')
+
+            if (epoch > args.debiasstart) and (alpha_u is not None):
+                alpha_vec = alpha_u.detach().view(-1).float()
+
+                q = torch.quantile(
+                    alpha_vec,
+                    torch.tensor([0.1, 0.5, 0.9], device=alpha_vec.device)
+                )
+                alpha_mean = float(alpha_vec.mean().item())
+                alpha_p10 = float(q[0].item())
+                alpha_p50 = float(q[1].item())
+                alpha_p90 = float(q[2].item())
+
+                head_mask_gpu = HEAD_MASK.to(y_raw.device)
+                tail_mask_gpu = TAIL_MASK.to(y_raw.device)
+
+                raw_head_mask = head_mask_gpu[y_raw]
+                raw_tail_mask = tail_mask_gpu[y_raw]
+                flip_mask = (y_raw != y_deb)
+
+                # 定义：
+                # headflip: raw 预测是 head，debiased 后发生改变
+                # tailflip: debiased 后预测成 tail，且与 raw 不同
+                headflip_mask = raw_head_mask & flip_mask
+                tailflip_mask = tail_mask_gpu[y_deb] & flip_mask
+
+                alpha_raw_head_mean = _masked_mean(alpha_vec, raw_head_mask)
+                alpha_raw_tail_mean = _masked_mean(alpha_vec, raw_tail_mask)
+                alpha_flip_mean = _masked_mean(alpha_vec, flip_mask)
+                alpha_headflip_mean = _masked_mean(alpha_vec, headflip_mask)
+                alpha_tailflip_mean = _masked_mean(alpha_vec, tailflip_mask)
+
             diag_write({
                 "epoch": epoch,
                 "iter": batch_idx,
@@ -641,7 +872,21 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
                 "bn_drift_l2": bn_drift,
                 "corr_logpb_logpi_labeled": corr_logpb_l,
                 "corr_logpb_logpi_pl_raw": corr_logpb_pl,
-                "zra_energy": zra_energy_now # [修改点] 写入 ZRA 极小化能量
+                "zra_energy": zra_energy_now,
+
+                # ---- alpha diagnostics ----
+                "alpha_mean": alpha_mean,
+                "alpha_p10": alpha_p10,
+                "alpha_p50": alpha_p50,
+                "alpha_p90": alpha_p90,
+                "alpha_raw_head_mean": alpha_raw_head_mean,
+                "alpha_raw_tail_mean": alpha_raw_tail_mean,
+                "alpha_flip_mean": alpha_flip_mean,
+                "alpha_headflip_mean": alpha_headflip_mean,
+                "alpha_tailflip_mean": alpha_tailflip_mean,
+                "ind_loss": float(loss_ind.item()) if torch.is_tensor(loss_ind) else float(loss_ind),
+                "ind_align_before": ind_align_before,
+                "ind_align_after": ind_align_after,
             })
 
         all_targets = torch.cat([targets_x2, targets_u2, targets_u2], dim=0)
@@ -655,10 +900,11 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
 
         Lx, Lu = criterion(logits_x,all_targets[:batch_size], logits_u, all_targets[batch_size:], select_mask)
 
-        loss=Lx+Lu
+        loss = Lx + Lu + args.ind_weight * loss_ind
         losses.update(loss.item(), inputs_x.size(0))
         losses_x.update(Lx.item(), inputs_x.size(0))
         losses_u.update(Lu.item(), inputs_x.size(0))
+        losses_ind.update(loss_ind.item(), inputs_x.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -671,7 +917,7 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
 
         # plot progress
         bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | ' \
-                      'Loss: {loss:.4f} | Loss_x: {loss_x:.4f} | Loss_u: {loss_u:.4f}'.format(
+                      'Loss: {loss:.4f} | Loss_x: {loss_x:.4f} | Loss_u: {loss_u:.4f} | Loss_ind: {loss_ind:.4f}'.format(
                     batch=batch_idx + 1,
                     size=args.val_iteration,
                     data=data_time.avg,
@@ -681,6 +927,7 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
                     loss=losses.avg,
                     loss_x=losses_x.avg,
                     loss_u=losses_u.avg,
+                    loss_ind=losses_ind.avg,
                     )
         bar.next()
     bar.finish()
@@ -689,6 +936,7 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
         'loss': losses.avg,
         'loss_x': losses_x.avg,
         'loss_u': losses_u.avg,
+        'loss_ind': losses_ind.avg,
         'accept_debias': accept_deb_meter.avg,
         'b_l2': b_l2_meter.avg,
         'b_entropy': b_entropy_meter.avg,
@@ -731,7 +979,7 @@ def validate(valloader,model,criterion,mode):
             # compute output
             targetsonehot = torch.zeros(inputs.size()[0], num_class).scatter_(1, targets.cpu().view(-1, 1).long(), 1)
             outputs,_=model(inputs)
-            outputs2=outputs-biaseddegree
+            outputs2 = apply_debias_logits(outputs, biaseddegree, scheme=args.debias_scheme, eps=args.aszra_eps)
 
             score = F.softmax(outputs, dim=1)
             score2 = F.softmax(outputs2, dim=1)

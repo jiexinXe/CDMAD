@@ -40,6 +40,12 @@ DIAG_F = None
 DIAG_WRITER = None
 PROBE_EMA = None  # torch tensor [C]
 
+# ---- Mean / IAB study globals ----
+EMA_CH_MEAN_L = None   # [1,C,1,1] EMA channel-mean from labeled batches
+EMA_CH_MEAN_U = None   # [1,C,1,1] EMA channel-mean from unlabeled batches
+EMA_CH_MEAN_ALL = None # [1,C,1,1] EMA channel-mean from both labeled+unlabeled
+
+
 # These will be set in main()
 CLASS_COUNTS_L = None  # np.ndarray [C]
 HEAD_MASK = None       # torch.BoolTensor [C] on CPU
@@ -94,6 +100,82 @@ def bn_drift_l2(before, after) -> float:
     for a, b in zip(after, before):
         s += (a.float() - b.float()).pow(2).sum().item()
     return float(math.sqrt(s))
+
+# ---------------- Mean / IAB probe helpers ----------------
+def _channel_stats(x: torch.Tensor):
+    # x: [B,C,H,W] in normalized space
+    ch_mean = x.mean(dim=(0,2,3), keepdim=True)   # [1,C,1,1]
+    ch_std  = x.std(dim=(0,2,3), keepdim=True).clamp_min(1e-6)
+    ch_min  = x.amin(dim=(0,2,3), keepdim=True)
+    ch_max  = x.amax(dim=(0,2,3), keepdim=True)
+    return ch_mean, ch_std, ch_min, ch_max
+
+@torch.no_grad()
+def _ema_update(buf: torch.Tensor, x_new: torch.Tensor, ema: float) -> torch.Tensor:
+    if buf is None:
+        return x_new.detach().clone()
+    return ema * buf + (1.0 - ema) * x_new.detach()
+
+@torch.no_grad()
+def update_mean_emas(inputs_x: torch.Tensor, inputs_u: torch.Tensor):
+    # Update EMA channel means for labeled/unlabeled/all using current batches.
+    global EMA_CH_MEAN_L, EMA_CH_MEAN_U, EMA_CH_MEAN_ALL
+    ema = float(args.mean_ema)
+    if inputs_x is not None:
+        ch_mean_x, _, _, _ = _channel_stats(inputs_x)
+        EMA_CH_MEAN_L = _ema_update(EMA_CH_MEAN_L, ch_mean_x, ema)
+    if inputs_u is not None:
+        ch_mean_u, _, _, _ = _channel_stats(inputs_u)
+        EMA_CH_MEAN_U = _ema_update(EMA_CH_MEAN_U, ch_mean_u, ema)
+    if (inputs_x is not None) and (inputs_u is not None):
+        xu = torch.cat([inputs_x, inputs_u], dim=0)
+        ch_mean_all, _, _, _ = _channel_stats(xu)
+        EMA_CH_MEAN_ALL = _ema_update(EMA_CH_MEAN_ALL, ch_mean_all, ema)
+
+def _expand_const(base_1c11: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    # base: [1,C,1,1] -> [1,C,H,W]
+    return base_1c11.expand(1, base_1c11.shape[1], H, W).contiguous()
+
+def iab_probe_batch(x_ref: torch.Tensor) -> torch.Tensor:
+    # Instance-adaptive baseline probes: per-instance channel-mean constant images. Returns [B,C,H,W].
+    B, C, H, W = x_ref.shape
+    mu_i = x_ref.mean(dim=(2,3), keepdim=True)  # [B,C,1,1]
+    return mu_i.expand(B, C, H, W).contiguous()
+
+def class_balanced_channel_mean_const(x_ref: torch.Tensor, y_idx: torch.Tensor, num_class: int) -> torch.Tensor:
+    # Class-balanced channel mean constant from x_ref using assignments y_idx [B]. Returns [1,C,1,1].
+    ch_mean, _, _, _ = _channel_stats(x_ref)
+    mu_i = x_ref.mean(dim=(2,3), keepdim=True)  # [B,C,1,1]
+    present = []
+    for k in range(num_class):
+        mask = (y_idx == k)
+        if mask.any():
+            present.append(mu_i[mask].mean(dim=0, keepdim=True))
+    if len(present) == 0:
+        return ch_mean
+    return torch.stack(present, dim=0).mean(dim=0)
+
+def class_balanced_mix_channel_mean_const(inputs_x: torch.Tensor, targets_x: torch.Tensor,
+                                         inputs_u: torch.Tensor, y_u: torch.Tensor,
+                                         num_class: int) -> torch.Tensor:
+    # Class-balanced channel mean using labeled true labels + unlabeled pseudo labels. Returns [1,C,1,1].
+    mu_x = inputs_x.mean(dim=(2,3), keepdim=True)
+    mu_u = inputs_u.mean(dim=(2,3), keepdim=True)
+    present = []
+    for k in range(num_class):
+        pts = []
+        mkx = (targets_x == k)
+        if mkx.any():
+            pts.append(mu_x[mkx].mean(dim=0, keepdim=True))
+        mku = (y_u == k)
+        if mku.any():
+            pts.append(mu_u[mku].mean(dim=0, keepdim=True))
+        if len(pts) > 0:
+            present.append(torch.stack(pts, dim=0).mean(dim=0))
+    if len(present) == 0:
+        ch_mean_all, _, _, _ = _channel_stats(torch.cat([inputs_x, inputs_u], dim=0))
+        return ch_mean_all
+    return torch.stack(present, dim=0).mean(dim=0)
 
 def make_probe_like(x_ref: torch.Tensor, kind: str) -> torch.Tensor:
     """Construct a probe image in the same input space as x_ref (already preprocessed).
@@ -153,10 +235,32 @@ def make_probe_like(x_ref: torch.Tensor, kind: str) -> torch.Tensor:
 
 @torch.no_grad()
 def get_baseline_probe(x_ref: torch.Tensor, baseline_picture: str) -> torch.Tensor:
+    # Return a probe image [1,C,H,W] for baseline modes that produce a single shared probe.
+    # NOTE: IAB-per-sample requires special handling (see train/validate).
     mode = baseline_picture.lower()
+    B, C, H, W = x_ref.shape
+
     if mode == "batch_mean":
         return x_ref.mean(dim=0, keepdim=True).contiguous()
+
+    if mode == "ema_mean_l":
+        if EMA_CH_MEAN_L is None:
+            return make_probe_like(x_ref, "mean")
+        return _expand_const(EMA_CH_MEAN_L.to(x_ref.device), H, W)
+
+    if mode == "ema_mean_u":
+        if EMA_CH_MEAN_U is None:
+            return make_probe_like(x_ref, "mean")
+        return _expand_const(EMA_CH_MEAN_U.to(x_ref.device), H, W)
+
+    if mode == "ema_mean_all":
+        if EMA_CH_MEAN_ALL is None:
+            return make_probe_like(x_ref, "mean")
+        return _expand_const(EMA_CH_MEAN_ALL.to(x_ref.device), H, W)
+
+    # Default deterministic/stochastic probes (white/black/gray/mean/gauss/unif/...)
     return make_probe_like(x_ref, mode)
+
 
 @contextlib.contextmanager
 def _temporary_eval(model: nn.Module):
@@ -180,6 +284,18 @@ def forward_probe_logits(model: nn.Module, x_probe: torch.Tensor, probe_mode: st
         with torch.inference_mode():
             logits, _ = model(x_probe)
     return logits.squeeze(0)
+
+def forward_probe_logits_batch(model: nn.Module, x_probe_batch: torch.Tensor, probe_mode: str) -> torch.Tensor:
+    # Return logits [B,C] for probe batch [B,C,H,W]. BN-safe if probe_mode=='eval'.
+    probe_mode = probe_mode.lower()
+    if probe_mode == "eval":
+        with _temporary_eval(model):
+            with torch.inference_mode():
+                logits, _ = model(x_probe_batch)
+    else:
+        with torch.inference_mode():
+            logits, _ = model(x_probe_batch)
+    return logits
 
 def diag_init(out_dir: str):
     global DIAG_F, DIAG_WRITER
@@ -286,10 +402,17 @@ parser.add_argument('--diag-file', type=str, default='diag_metrics.csv',
 parser.add_argument('--probe-mode', type=str, default='eval', choices=['eval'],
                 help='Always eval to avoid BN running-stats writeback during probe forward.')
 parser.add_argument('--baseline-picture', type=str, default='white',
-                choices=['white', 'black', 'gray', 'mean', 'batch_mean'],
-                help='Single baseline picture for debiasing. Exactly one mode is used each run.')
+                choices=['white', 'black', 'gray', 'mean', 'batch_mean', 'ema_mean_l', 'ema_mean_u', 'ema_mean_all',
+                         'cb_mean_u', 'cb_mean_mix', 'iab_avg', 'iab_per'],
+                help='Baseline mode for debiasing probe (mean/EMA/class-balanced/IAB variants).')
 parser.add_argument('--probe-ema', type=float, default=0.99,
                     help='EMA factor for probe logits stability tracking (default: 0.99)')
+
+parser.add_argument('--mean-ema', type=float, default=0.99,
+                    help='EMA factor for EMA mean baselines (ema_mean_*) (default: 0.99)')
+parser.add_argument('--test-probe', type=str, default='fixed_first',
+                    choices=['fixed_first', 'per_batch'],
+                    help='Validation baseline: fixed from first batch or per-batch (default: fixed_first).')
 
 parser.add_argument('--log-bn-drift', action='store_true',
                 help='Log BN running-stats drift; should be near zero in eval probe mode.')
@@ -479,24 +602,62 @@ def train(labeled_trainloader,unlabeled_trainloader, model,optimizer, ema_optimi
         inputs_u, inputs_u2, inputs_u3  = inputs_u.cuda(), inputs_u2.cuda(), inputs_u3.cuda()
 
 
-        # ---------------- CDMAD debias (fixed white probe, BN-safe) ----------------
+        # ---------------- Debias probe (BN-safe) & optional Mean/IAB variants ----------------
         bn_drift = 0.0
+
+        # Update EMA means (used by ema_mean_* modes)
+        with torch.no_grad():
+            update_mean_emas(inputs_x, inputs_u)
+
         with torch.no_grad():
             bn_before = None
             if args.diag_enable and args.log_bn_drift and (batch_idx % args.diag_freq == 0):
                 bn_before = bn_snapshot(model)
 
-            baseline_probe = get_baseline_probe(inputs_u, args.baseline_picture)
-            b_logits = forward_probe_logits(model, baseline_probe, args.probe_mode).detach()
+            # 1) Raw unlabeled logits in TRAIN mode (normal BN behavior)
+            outputs_u_raw, _ = model(inputs_u)
+
+            mode = args.baseline_picture.lower()
+
+            # 2) Compute debias term(s) using BN-safe probe forward
+            b_logits = None          # [C] for logging / global subtraction
+            b_logits_per = None      # [Bu,C] for per-sample subtraction (IAB-per)
+
+            if mode in ("iab_per", "iab_avg"):
+                probe_b = iab_probe_batch(inputs_u)  # [Bu,C,H,W]
+                logits_b = forward_probe_logits_batch(model, probe_b, args.probe_mode).detach()  # [Bu,C]
+                if mode == "iab_per":
+                    b_logits_per = logits_b
+                    b_logits = logits_b.mean(dim=0)
+                else:
+                    b_logits = logits_b.mean(dim=0)
+
+            elif mode in ("cb_mean_u", "cb_mean_mix"):
+                # class-balanced channel mean constant using pseudo labels (raw) (+ labeled true labels if mix)
+                y_u = torch.argmax(F.softmax(outputs_u_raw, dim=1), dim=1)
+                if mode == "cb_mean_mix":
+                    y_x = targets_x.detach()
+                    base_1c11 = class_balanced_mix_channel_mean_const(inputs_x, y_x, inputs_u, y_u, num_class)
+                else:
+                    base_1c11 = class_balanced_channel_mean_const(inputs_u, y_u, num_class)
+                probe = _expand_const(base_1c11.to(inputs_u.device), inputs_u.size(2), inputs_u.size(3))
+                b_logits = forward_probe_logits(model, probe, args.probe_mode).detach()
+
+            else:
+                baseline_probe = get_baseline_probe(inputs_u, args.baseline_picture)
+                b_logits = forward_probe_logits(model, baseline_probe, args.probe_mode).detach()
 
             if bn_before is not None:
                 bn_after = bn_snapshot(model)
                 bn_drift = bn_drift_l2(bn_before, bn_after)
 
-            outputs_u_raw, _ = model(inputs_u)
+            # 3) Apply debias
             outputs_u_debias = outputs_u_raw
             if epoch > args.debiasstart:
-                outputs_u_debias = outputs_u_raw - b_logits.view(1, -1)
+                if b_logits_per is not None:
+                    outputs_u_debias = outputs_u_raw - b_logits_per
+                else:
+                    outputs_u_debias = outputs_u_raw - b_logits.view(1, -1)
 
             targets_u_raw = F.softmax(outputs_u_raw, dim=1).detach()
             targets_u2 = F.softmax(outputs_u_debias, dim=1).detach()
@@ -653,10 +814,21 @@ def validate(valloader,model,criterion,mode):
     bar = Bar(f'{mode}', max=len(valloader))
 
     with torch.no_grad():
-        first_batch = next(iter(valloader))
-        x_ref = first_batch[0].cuda(non_blocking=True) if isinstance(first_batch, (list, tuple)) else first_batch.cuda(non_blocking=True)
-        baseline_probe = get_baseline_probe(x_ref, args.baseline_picture)
-        biaseddegree = forward_probe_logits(model, baseline_probe, args.probe_mode).view(1, -1)
+        fixed_biaseddegree = None
+        if args.test_probe == 'fixed_first':
+            first_batch = next(iter(valloader))
+            x_ref = first_batch[0].cuda(non_blocking=True) if isinstance(first_batch, (list, tuple)) else first_batch.cuda(non_blocking=True)
+            mode = args.baseline_picture.lower()
+            if mode in ('iab_per','cb_mean_u','cb_mean_mix'):
+                fixed_biaseddegree = None
+            elif mode == 'iab_avg':
+                probe_b = iab_probe_batch(x_ref)
+                logits_b = forward_probe_logits_batch(model, probe_b, args.probe_mode).detach()
+                fixed_biaseddegree = logits_b.mean(dim=0, keepdim=True)
+            else:
+                baseline_probe = get_baseline_probe(x_ref, args.baseline_picture)
+                fixed_biaseddegree = forward_probe_logits(model, baseline_probe, args.probe_mode).view(1, -1)
+
         for batch_idx, (inputs, targets, _) in enumerate(valloader):
 
             data_time.update(time.time() - end)
@@ -664,10 +836,34 @@ def validate(valloader,model,criterion,mode):
             # compute output
             targetsonehot = torch.zeros(inputs.size()[0], num_class).scatter_(1, targets.cpu().view(-1, 1).long(), 1)
             outputs,_=model(inputs)
-            outputs2=outputs-biaseddegree
 
-            score = F.softmax(outputs)
-            score2 = F.softmax(outputs2)
+            mode = args.baseline_picture.lower()
+            biaseddegree = fixed_biaseddegree
+            if biaseddegree is None:
+                if mode == 'iab_per':
+                    probe_b = iab_probe_batch(inputs)
+                    logits_b = forward_probe_logits_batch(model, probe_b, args.probe_mode).detach()
+                    outputs2 = outputs - logits_b
+                elif mode == 'iab_avg':
+                    probe_b = iab_probe_batch(inputs)
+                    logits_b = forward_probe_logits_batch(model, probe_b, args.probe_mode).detach()
+                    biaseddegree = logits_b.mean(dim=0, keepdim=True)
+                    outputs2 = outputs - biaseddegree
+                elif mode in ('cb_mean_u','cb_mean_mix'):
+                    y_u = torch.argmax(F.softmax(outputs, dim=1), dim=1)
+                    base_1c11 = class_balanced_channel_mean_const(inputs, y_u, num_class)
+                    probe = _expand_const(base_1c11.to(inputs.device), inputs.size(2), inputs.size(3))
+                    biaseddegree = forward_probe_logits(model, probe, args.probe_mode).view(1, -1)
+                    outputs2 = outputs - biaseddegree
+                else:
+                    baseline_probe = get_baseline_probe(inputs, args.baseline_picture)
+                    biaseddegree = forward_probe_logits(model, baseline_probe, args.probe_mode).view(1, -1)
+                    outputs2 = outputs - biaseddegree
+            else:
+                outputs2 = outputs - biaseddegree
+
+            score  = F.softmax(outputs,  dim=1)
+            score2 = F.softmax(outputs2, dim=1)
 
 
             prediction=torch.argmax(score,dim=1)
